@@ -74,6 +74,9 @@ class BotConfig:
     image_types: tuple = ('.png', '.jpg', '.jpeg', '.gif', '.webp')
     max_image_size_mb: float = 20.0
     
+    # Supported text file types
+    text_file_types: tuple = ('.md', '.txt', '.py', '.js', '.ts', '.json', '.csv', '.html', '.css', '.yaml', '.yml', '.toml', '.xml', '.sql', '.sh', '.bash', '.r', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.hpp')
+    
     # Bot behavior
     system_prompt: str = """You are Claude, an AI assistant made by Anthropic, chatting in a Discord server. 
 
@@ -543,6 +546,22 @@ class ConversationManager:
                                 "type": "text", 
                                 "text": f"[Image attachment: {attachment.filename} - failed to load]"
                             })
+                
+                # Handle text files
+                elif any(attachment.filename.lower().endswith(ext) for ext in CONFIG.text_file_types):
+                    if attachment.size <= 1024 * 1024:  # 1MB limit for text files
+                        try:
+                            file_content = await self._fetch_text_file(attachment.url)
+                            if file_content:
+                                content.append({
+                                    "type": "text",
+                                    "text": f"\n--- File: {attachment.filename} ---\n{file_content}\n--- End of {attachment.filename} ---\n"
+                                })
+                        except Exception as e:
+                            content.append({
+                                "type": "text",
+                                "text": f"[Text file: {attachment.filename} - failed to load: {e}]"
+                            })
             
             if content:
                 role = "assistant" if msg.author.bot else "user"
@@ -569,6 +588,19 @@ class ConversationManager:
                 if resp.status == 200:
                     data = await resp.read()
                     return base64.b64encode(data).decode('utf-8')
+        return None
+    
+    async def _fetch_text_file(self, url: str) -> Optional[str]:
+        """Fetch text file from URL and return contents."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    # Try UTF-8 first, fall back to latin-1
+                    try:
+                        return data.decode('utf-8')
+                    except UnicodeDecodeError:
+                        return data.decode('latin-1')
         return None
     
     def estimate_tokens(self, messages: list[dict], guild_id: int) -> int:
@@ -800,6 +832,19 @@ class ClaudeBot(commands.Bot):
                                         "media_type": media_type,
                                         "data": image_data
                                     }
+                                })
+                        except Exception:
+                            pass
+                
+                # Handle text files
+                elif any(attachment.filename.lower().endswith(ext) for ext in CONFIG.text_file_types):
+                    if attachment.size <= 1024 * 1024:  # 1MB limit
+                        try:
+                            file_content = await self.manager._fetch_text_file(attachment.url)
+                            if file_content:
+                                content_parts.append({
+                                    "type": "text",
+                                    "text": f"\n--- File: {attachment.filename} ---\n{file_content}\n--- End of {attachment.filename} ---\n"
                                 })
                         except Exception:
                             pass
