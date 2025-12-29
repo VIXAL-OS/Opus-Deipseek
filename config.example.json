@@ -1,0 +1,7 @@
+{
+  "allowed_channels": [
+    123456789012345678,
+    234567890123456789
+  ],
+  "_comment": "Get channel IDs by enabling Developer Mode in Discord settings, then right-click a channel"
+}
