@@ -31,8 +31,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from functools import partial
 import json
 import os
+import asyncio
 import asyncio
 import aiohttp
 import base64
@@ -883,7 +885,9 @@ class ClaudeBot(commands.Bot):
         system = "\n\n".join(system_parts)
         
         try:
-            response = self.claude.messages.create(
+            # Run in thread pool so we don't block Discord's event loop
+            response = await asyncio.to_thread(
+                self.claude.messages.create,
                 model=CONFIG.model,
                 max_tokens=CONFIG.max_tokens,
                 system=system,
@@ -952,8 +956,9 @@ class ClaudeBot(commands.Bot):
         messages = [{"role": "user", "content": query}]
         
         try:
-            # Initial request with web search tool
-            response = self.claude.messages.create(
+            # Initial request with web search tool (run in thread pool)
+            response = await asyncio.to_thread(
+                self.claude.messages.create,
                 model=CONFIG.model,
                 max_tokens=CONFIG.max_tokens,
                 system=system,
@@ -999,8 +1004,9 @@ class ClaudeBot(commands.Bot):
                     }]
                 })
                 
-                # Continue the conversation
-                response = self.claude.messages.create(
+                # Continue the conversation (run in thread pool)
+                response = await asyncio.to_thread(
+                    self.claude.messages.create,
                     model=CONFIG.model,
                     max_tokens=CONFIG.max_tokens,
                     system=system,
@@ -1281,15 +1287,19 @@ class ClaudeBot(commands.Bot):
                 messages = await self.manager.fetch_thread_history(message.channel, limit=50)
                 if messages:
                     try:
-                        # Ask Claude to summarize
-                        summary_response = self.claude.messages.create(
+                        # Build the conversation text
+                        conversation_text = "\n".join(
+                            m["content"] if isinstance(m["content"], str) else str(m["content"])
+                            for m in messages
+                        )
+                        
+                        # Ask Claude to summarize (run in thread pool)
+                        summary_response = await asyncio.to_thread(
+                            self.claude.messages.create,
                             model=CONFIG.model,
                             max_tokens=200,
                             system="Summarize this conversation in 1-2 sentences. Focus on the key topic and any decisions/outcomes. Be concise.",
-                            messages=[{"role": "user", "content": f"Conversation to summarize:\n\n" + "\n".join(
-                                m["content"] if isinstance(m["content"], str) else str(m["content"])
-                                for m in messages
-                            )}]
+                            messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
                         summary = summary_response.content[0].text.strip()
                         
