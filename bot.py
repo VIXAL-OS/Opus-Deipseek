@@ -1174,7 +1174,9 @@ class ClaudeBot(commands.Bot):
             else:
                 lines.append("📝 **Working notes**: None yet")
             
-            await message.channel.send("\n".join(lines)[:1990])
+            # Send in chunks if too long
+            full_text = "\n".join(lines)
+            await self._send_response(message.channel, full_text)
         
         elif cmd == "!remember":
             # !remember key value
