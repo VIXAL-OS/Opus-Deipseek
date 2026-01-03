@@ -653,13 +653,27 @@ class ConversationManager:
         )
     
     def save_memories(self, filepath: str = "memories.json") -> None:
-        """Save all memories to disk."""
+        """Save all memories to disk (synchronous - use save_memories_async in async contexts)."""
         data = {
             str(guild_id): memory.to_dict()
             for guild_id, memory in self.memories.items()
         }
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
+        self._memories_dirty = False
+    
+    async def save_memories_async(self, filepath: str = "memories.json") -> None:
+        """Save memories without blocking the event loop."""
+        await asyncio.to_thread(self.save_memories, filepath)
+    
+    def mark_dirty(self) -> None:
+        """Mark memories as needing to be saved."""
+        self._memories_dirty = True
+    
+    @property
+    def needs_save(self) -> bool:
+        """Check if memories need saving."""
+        return getattr(self, '_memories_dirty', False)
     
     def load_memories(self, filepath: str = "memories.json") -> None:
         """Load memories from disk."""
@@ -713,6 +727,27 @@ class ClaudeBot(commands.Bot):
     async def setup_hook(self) -> None:
         """Called when bot is ready."""
         self.manager.load_memories()
+        # Start background save task
+        self._save_task = self.loop.create_task(self._periodic_save())
+    
+    async def _periodic_save(self) -> None:
+        """Background task to save memories every 60 seconds if dirty."""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                if self.manager.needs_save:
+                    await self.manager.save_memories_async()
+                    print("💾 Memories saved (background)")
+            except Exception as e:
+                print(f"⚠️  Error saving memories: {e}")
+            await asyncio.sleep(60)  # Check every 60 seconds
+    
+    async def close(self) -> None:
+        """Clean shutdown - save memories before closing."""
+        if self.manager.needs_save:
+            print("💾 Saving memories before shutdown...")
+            await self.manager.save_memories_async()
+        await super().close()
     
     async def on_ready(self) -> None:
         print(f"✅ Logged in as {self.user}")
@@ -772,8 +807,8 @@ class ClaudeBot(commands.Bot):
         # Send response (handle Discord's 2000 char limit)
         await self._send_response(thread, response, files)
         
-        # Save memories periodically
-        self.manager.save_memories()
+        # Mark memories as needing save (actual save happens in background task)
+        self.manager.mark_dirty()
     
     async def _ensure_thread(self, message: discord.Message) -> tuple[discord.Thread, bool]:
         """Get existing thread or create new one. Returns (thread, is_new)."""
