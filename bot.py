@@ -51,7 +51,7 @@ load_dotenv()
 @dataclass
 class BotConfig:
     # Model settings
-    model: str = "claude-opus-4-6-20250414"
+    model: str = "claude-opus-4-6"
     max_tokens: int = 4096
     
     # Context management (THE KEY TO NOT BEING MYK)

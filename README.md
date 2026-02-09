@@ -260,7 +260,7 @@ Edit the `BotConfig` class in `bot.py`:
 ```python
 @dataclass
 class BotConfig:
-    model: str = "claude-opus-4-6-20250414"  # or claude-sonnet-4-20250514 for cheaper
+    model: str = "claude-opus-4-6"  # or claude-sonnet-4-20250514 for cheaper
     max_tokens: int = 4096
     max_messages_to_fetch: int = 20          # Discord history to include
     max_longterm_memories: int = 25          # Permanent memory slots
