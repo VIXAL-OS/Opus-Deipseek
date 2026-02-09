@@ -1,6 +1,6 @@
-# Claude Opus 4.5 Discord Bot
+# Claude Opus 4.6 Discord Bot
 
-A cost-effective Discord bot powered by Claude Opus 4.5 with smart context management.
+A cost-effective Discord bot powered by Claude Opus 4.6 with smart context management.
 
 ## Features
 
@@ -59,7 +59,7 @@ Explicit facts that never decay:
 | Context per message | 50,000+ tokens | ~3,000-8,000 tokens ✨ |
 
 **Estimated costs:**
-- ~$0.02-0.05 per message with Opus 4.5
+- ~$0.02-0.05 per message with Opus 4.6
 - $20 prepaid → 400-1000 messages
 - Low-traffic dev server = weeks/months of usage
 
@@ -260,7 +260,7 @@ Edit the `BotConfig` class in `bot.py`:
 ```python
 @dataclass
 class BotConfig:
-    model: str = "claude-opus-4-5-20250514"  # or claude-sonnet-4-20250514 for cheaper
+    model: str = "claude-opus-4-6-20250414"  # or claude-sonnet-4-20250514 for cheaper
     max_tokens: int = 4096
     max_messages_to_fetch: int = 20          # Discord history to include
     max_longterm_memories: int = 25          # Permanent memory slots
