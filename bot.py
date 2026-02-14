@@ -675,9 +675,6 @@ class ConversationManager:
                         if ref_msg.author.bot:
                             ref_text = re.sub(r'^(\*\*\[(?:Claude|Deepseek)\]\*\*\s*)+', '', ref_text)
                         ref_author = "bot" if ref_msg.author.bot else ref_msg.author.display_name
-                        # Truncate long replies to keep context manageable
-                        if len(ref_text) > 300:
-                            ref_text = ref_text[:300] + "..."
                         content.append({
                             "type": "text",
                             "text": f"[replying to {ref_author}: {ref_text}]"
