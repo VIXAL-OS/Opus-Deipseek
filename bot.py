@@ -662,7 +662,29 @@ class ConversationManager:
             
             # Build content (can be text + images)
             content = []
-            
+
+            # Include replied-to message context if this is a reply
+            if msg.reference and msg.reference.message_id:
+                try:
+                    ref_msg = msg.reference.resolved
+                    if ref_msg is None:
+                        ref_msg = await channel.fetch_message(msg.reference.message_id)
+                    if ref_msg and ref_msg.content:
+                        ref_text = ref_msg.content
+                        # Strip model labels from referenced bot messages too
+                        if ref_msg.author.bot:
+                            ref_text = re.sub(r'^(\*\*\[(?:Claude|Deepseek)\]\*\*\s*)+', '', ref_text)
+                        ref_author = "bot" if ref_msg.author.bot else ref_msg.author.display_name
+                        # Truncate long replies to keep context manageable
+                        if len(ref_text) > 300:
+                            ref_text = ref_text[:300] + "..."
+                        content.append({
+                            "type": "text",
+                            "text": f"[replying to {ref_author}: {ref_text}]"
+                        })
+                except (discord.NotFound, discord.HTTPException):
+                    pass  # Referenced message deleted or inaccessible
+
             # Add text if present
             if msg.content:
                 author_prefix = "" if msg.author.bot else f"{msg.author.display_name}: "
@@ -1010,22 +1032,24 @@ class ClaudeBot(commands.Bot):
         if channel_id not in self.allowed_channels and parent_id not in self.allowed_channels:
             return
         
-        # Check for direct model invocation (!claude / !deepseek)
+        # Check for direct model invocation (!claude / !opus / !deepseek)
         forced_provider = None
         content_lower = (message.content or "").lower()
-        if content_lower.startswith("!claude ") or content_lower == "!claude":
-            if not self.claude_provider.enabled:
-                await message.channel.send("❌ Claude is not configured (no API key).")
-                return
-            forced_provider = self.claude_provider
-            # Strip the !claude prefix from the message for the AI
-            message.content = message.content[len("!claude"):].strip()
-        elif content_lower.startswith("!deepseek ") or content_lower == "!deepseek":
-            if not self.deepseek_provider.enabled:
-                await message.channel.send("❌ Deepseek is not configured (no API key).")
-                return
-            forced_provider = self.deepseek_provider
-            message.content = message.content[len("!deepseek"):].strip()
+        for prefix in ("!claude", "!opus"):
+            if content_lower.startswith(prefix + " ") or content_lower == prefix:
+                if not self.claude_provider.enabled:
+                    await message.channel.send("❌ Claude is not configured (no API key).")
+                    return
+                forced_provider = self.claude_provider
+                message.content = message.content[len(prefix):].strip()
+                break
+        if forced_provider is None:
+            if content_lower.startswith("!deepseek ") or content_lower == "!deepseek":
+                if not self.deepseek_provider.enabled:
+                    await message.channel.send("❌ Deepseek is not configured (no API key).")
+                    return
+                forced_provider = self.deepseek_provider
+                message.content = message.content[len("!deepseek"):].strip()
 
         # Handle commands (but not if we just consumed a model prefix)
         if forced_provider is None and message.content.startswith('!'):
@@ -1089,11 +1113,16 @@ class ClaudeBot(commands.Bot):
             return
 
         emoji = str(reaction.emoji)
-        if emoji in ('\U0001f44d', '\u2764\ufe0f', '\U0001f525', '\u2705'):  # thumbs up, heart, fire, check
+        # Positive: thumbs up, heart, fire, check, joy, sparkling heart, 100
+        good_emoji = ('\U0001f44d', '\u2764\ufe0f', '\U0001f525', '\u2705',
+                      '\U0001f602', '\U0001f496', '\U0001f4af')
+        # Negative: thumbs down, x, confused
+        bad_emoji = ('\U0001f44e', '\u274c', '\U0001f615')
+        if emoji in good_emoji:
             self.manager.calibration.record_feedback(
                 self.manager.last_response_index[channel_id], "good"
             )
-        elif emoji in ('\U0001f44e', '\u274c', '\U0001f615'):  # thumbs down, x, confused
+        elif emoji in bad_emoji:
             self.manager.calibration.record_feedback(
                 self.manager.last_response_index[channel_id], "bad"
             )
@@ -1926,8 +1955,8 @@ class ClaudeBot(commands.Bot):
 `!search <query>` - Web search (costs extra, ~$0.01-0.03)
 
 **Multi-model (Hydra):**
-`!claude <message>` - Force Claude to respond to this message
-`!deepseek <message>` - Force Deepseek to respond to this message
+`!claude <message>` / `!opus <message>` - Force Claude to respond
+`!deepseek <message>` - Force Deepseek to respond
 `!models` - Show available models and their usage stats
 `!prefer [claude|deepseek|auto]` - Set model preference for this channel
 `!calibration` - Show model confidence calibration stats
