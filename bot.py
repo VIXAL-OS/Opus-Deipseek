@@ -703,16 +703,20 @@ class ConversationManager:
             if msg.content:
                 author_prefix = "" if msg.author.bot else f"{msg.author.display_name}: "
                 text = msg.content
-                # Convert bold model labels to plain text to prevent accumulation
-                # but KEEP the identity so models know who said what
-                # e.g., "**[Deepseek]** hello" -> "[Deepseek] hello" (not stripped entirely)
-                # Only the **bold** format accumulates; plain [brackets] are stable.
+                # Normalize model labels: strip ALL label formats (bold and plain),
+                # then re-add a single clean plain-text label for identity.
+                # This prevents accumulation from either format.
                 if msg.author.bot:
-                    # Find which model label is present, keep it as plain text
-                    label_match = re.match(r'^(\*\*\[(Claude|Deepseek)\]\*\*\s*)+', text)
+                    # First, extract which model this is from (check bold first, then plain)
+                    model_label = None
+                    label_match = re.match(r'^(?:\*\*\[(Claude|Deepseek)\]\*\*\s*|\[(Claude|Deepseek)\]\s*)+', text)
                     if label_match:
-                        model_label = label_match.group(2)  # Last captured model name
-                        text = f"[{model_label}] " + text[label_match.end():]
+                        # Get the last model name captured (from either group)
+                        model_label = label_match.group(1) or label_match.group(2)
+                        text = text[label_match.end():]
+                    # Re-add a single clean label
+                    if model_label:
+                        text = f"[{model_label}] {text}"
                 content.append({
                     "type": "text",
                     "text": f"{author_prefix}{text}"
@@ -1252,7 +1256,12 @@ class ClaudeBot(commands.Bot):
                 "to translate it to English for the group. When you think it's relevant or fun, include "
                 "little mini-lessons breaking down interesting characters or words — e.g., how a character "
                 "is composed, what its radicals mean, etymological tidbits, or how a phrase differs from "
-                "its literal translation. Keep the lessons bite-sized and natural, not lecture-y."
+                "its literal translation. Keep the lessons bite-sized and natural, not lecture-y.\n\n"
+                "**Important: Always respond in English.** You can use Chinese characters inline when "
+                "showing original text, breaking down words, or when a concept has no clean English "
+                "equivalent — but your response itself should always be in English. Never reply with "
+                "a wall of Chinese text. Your job is to be a bridge between languages, not to exclude "
+                "English speakers from the conversation."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
