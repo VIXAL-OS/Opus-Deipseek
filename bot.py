@@ -35,7 +35,6 @@ from functools import partial
 import json
 import os
 import asyncio
-import asyncio
 import aiohttp
 import base64
 import re
@@ -51,23 +50,19 @@ load_dotenv()
 @dataclass
 class BotConfig:
     # Model settings
-    model: str = "claude-opus-4-6"
     max_tokens: int = 4096
-    
+    default_model: str = "auto"  # "auto", "claude", or "deepseek"
+
     # Context management (THE KEY TO NOT BEING MYK)
     max_messages_to_fetch: int = 20        # Fetch from Discord history
     max_longterm_memories: int = 25        # Explicit memories (!remember)
     max_working_notes: int = 10            # Auto-notes from Claude
     working_memory_decay_hours: float = 48.0  # Notes fade after ~48h
-    
+
     # Token budgeting (approximate)
     max_input_tokens: int = 50000          # Stay well under 200k limit
     chars_per_token: float = 4.0           # Rough estimate
-    
-    # Cost tracking (Opus 4.6 pricing as of early 2026)
-    input_cost_per_million: float = 15.0   # $15/M input tokens
-    output_cost_per_million: float = 75.0  # $75/M output tokens
-    
+
     # Web search settings
     web_search_enabled: bool = True
     max_search_results_in_embed: int = 5   # How many sources to show
@@ -80,7 +75,7 @@ class BotConfig:
     text_file_types: tuple = ('.md', '.txt', '.py', '.js', '.ts', '.json', '.csv', '.html', '.css', '.yaml', '.yml', '.toml', '.xml', '.sql', '.sh', '.bash', '.r', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.hpp')
     
     # Bot behavior
-    system_prompt: str = """You are Claude, an AI assistant made by Anthropic, chatting in a Discord server. 
+    system_prompt: str = """You are {model_identity}, chatting in a Discord server.
 
 You're helpful, harmless, and honest. You have a warm, curious personality. You can be playful but you're also genuinely knowledgeable and thoughtful.
 
@@ -89,6 +84,14 @@ Some context about this server:
 - The humans here are working on neuroscience research, distributed databases, and AI tooling
 - Be concise in casual chat, detailed when asked technical questions
 - You can use markdown formatting, but Discord has a 2000 char limit per message
+
+## Multi-model system
+
+You are one of potentially multiple AI models responding in this server (the "Hydra" system).
+Your responses will be labeled with your model name (e.g., [Claude] or [Deepseek]).
+When you see labeled responses from other models in the conversation history,
+treat them as prior assistant messages - you share the same memory system.
+Don't be competitive - you're collaborators with different strengths.
 
 ## Special capabilities
 
@@ -122,7 +125,7 @@ When you reference information from your working notes, they get refreshed and s
 
 Write working notes for things like:
 - Deadlines or dates people mention
-- Current projects/tasks being discussed  
+- Current projects/tasks being discussed
 - Preferences people express
 - Names, relationships, context that comes up
 - Technical details that might be relevant later
@@ -130,6 +133,154 @@ Write working notes for things like:
 Don't be shy about noting things! The decay system handles cleanup automatically."""
 
 CONFIG = BotConfig()
+
+# =============================================================================
+# MODEL PROVIDERS
+# =============================================================================
+
+@dataclass
+class ModelProvider:
+    """Configuration and state for a single AI model provider."""
+    name: str                          # Display name: "Claude", "Deepseek"
+    model_id: str                      # API model string
+    input_cost_per_million: float      # $/M input tokens
+    output_cost_per_million: float     # $/M output tokens
+    max_tokens: int = 4096
+    enabled: bool = True
+    supports_vision: bool = True       # Can handle image content
+    supports_web_search: bool = False  # Has built-in web search tool
+
+    # Runtime stats
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_requests: int = 0
+
+    def get_cost(self) -> float:
+        """Get total cost for this provider."""
+        input_cost = (self.total_input_tokens / 1_000_000) * self.input_cost_per_million
+        output_cost = (self.total_output_tokens / 1_000_000) * self.output_cost_per_million
+        return input_cost + output_cost
+
+    def to_stats_dict(self) -> dict:
+        return {
+            "input_tokens": self.total_input_tokens,
+            "output_tokens": self.total_output_tokens,
+            "requests": self.total_requests
+        }
+
+    def load_stats(self, data: dict) -> None:
+        self.total_input_tokens = data.get("input_tokens", 0)
+        self.total_output_tokens = data.get("output_tokens", 0)
+        self.total_requests = data.get("requests", 0)
+
+
+CLAUDE_PROVIDER = ModelProvider(
+    name="Claude",
+    model_id="claude-opus-4-6",
+    input_cost_per_million=15.0,
+    output_cost_per_million=75.0,
+    supports_vision=True,
+    supports_web_search=True,
+)
+
+DEEPSEEK_PROVIDER = ModelProvider(
+    name="Deepseek",
+    model_id="deepseek-chat",
+    input_cost_per_million=0.28,
+    output_cost_per_million=0.42,
+    supports_vision=False,
+    supports_web_search=False,
+)
+
+
+# =============================================================================
+# CALIBRATION TRACKER
+# =============================================================================
+
+@dataclass
+class CalibrationRecord:
+    """A single confidence bid record for calibration tracking."""
+    model_name: str
+    confidence: float
+    timestamp: datetime
+    user_reaction: Optional[str] = None  # "good" / "bad" / None
+
+
+class CalibrationTracker:
+    """Tracks model confidence calibration over time."""
+
+    def __init__(self, max_records: int = 200):
+        self.records: list[CalibrationRecord] = []
+        self.max_records = max_records
+
+    def record_bid(self, model_name: str, confidence: float) -> int:
+        """Record a confidence bid. Returns the record index for later feedback."""
+        record = CalibrationRecord(
+            model_name=model_name,
+            confidence=confidence,
+            timestamp=datetime.now()
+        )
+        self.records.append(record)
+        if len(self.records) > self.max_records:
+            self.records.pop(0)
+        return len(self.records) - 1
+
+    def record_feedback(self, index: int, reaction: str) -> None:
+        """Record user feedback on a response."""
+        if 0 <= index < len(self.records):
+            self.records[index].user_reaction = reaction
+
+    def get_calibration_summary(self, model_name: str) -> dict:
+        """Get calibration stats for a model by confidence bucket."""
+        model_records = [r for r in self.records if r.model_name == model_name]
+        rated = [r for r in model_records if r.user_reaction is not None]
+
+        if not rated:
+            return {"total": len(model_records), "rated": 0, "buckets": {}}
+
+        buckets = {"high (0.7-1.0)": [], "medium (0.4-0.7)": [], "low (0.0-0.4)": []}
+        for r in rated:
+            if r.confidence >= 0.7:
+                buckets["high (0.7-1.0)"].append(r.user_reaction == "good")
+            elif r.confidence >= 0.4:
+                buckets["medium (0.4-0.7)"].append(r.user_reaction == "good")
+            else:
+                buckets["low (0.0-0.4)"].append(r.user_reaction == "good")
+
+        summary = {}
+        for bucket_name, results in buckets.items():
+            if results:
+                summary[bucket_name] = {
+                    "count": len(results),
+                    "success_rate": sum(results) / len(results)
+                }
+
+        return {"total": len(model_records), "rated": len(rated), "buckets": summary}
+
+    def to_dict(self) -> list:
+        return [
+            {
+                "model": r.model_name,
+                "confidence": r.confidence,
+                "timestamp": r.timestamp.isoformat(),
+                "feedback": r.user_reaction
+            }
+            for r in self.records
+        ]
+
+    @classmethod
+    def from_dict(cls, data: list, max_records: int = 200) -> "CalibrationTracker":
+        tracker = cls(max_records=max_records)
+        for item in data:
+            record = CalibrationRecord(
+                model_name=item["model"],
+                confidence=item["confidence"],
+                timestamp=datetime.fromisoformat(item["timestamp"]),
+                user_reaction=item.get("feedback")
+            )
+            tracker.records.append(record)
+        return tracker
+
 
 # =============================================================================
 # MEMORY SYSTEM (Two-tier: Working + Long-term)
@@ -410,9 +561,11 @@ class ConversationManager:
                 working_decay_hours=CONFIG.working_memory_decay_hours
             )
         )
-        # Cost tracking
-        self.total_input_tokens: int = 0
-        self.total_output_tokens: int = 0
+        # Calibration tracking for model selection
+        self.calibration = CalibrationTracker()
+        # Track last response per channel for feedback
+        self.last_response_model: dict[int, str] = {}
+        self.last_response_index: dict[int, int] = {}
     
     async def fetch_thread_index(
         self,
@@ -632,39 +785,56 @@ class ConversationManager:
         working_count = len(memory.working.notes)
         longterm_count = len(memory.longterm.entries)
         est_tokens = self.estimate_tokens(messages, guild_id)
-        est_cost = (est_tokens / 1_000_000) * CONFIG.input_cost_per_million
-        
+        # Use Claude pricing as worst-case estimate
+        est_cost = (est_tokens / 1_000_000) * CLAUDE_PROVIDER.input_cost_per_million
+
         return (
             f"📊 Context: {msg_count} messages, "
             f"{working_count}/{CONFIG.max_working_notes} working notes, "
             f"{longterm_count}/{CONFIG.max_longterm_memories} long-term memories, "
-            f"~{est_tokens:,} tokens (~${est_cost:.3f})"
+            f"~{est_tokens:,} tokens (~${est_cost:.3f} worst-case)"
         )
     
-    def get_cost_summary(self) -> str:
-        """Get total cost summary."""
-        input_cost = (self.total_input_tokens / 1_000_000) * CONFIG.input_cost_per_million
-        output_cost = (self.total_output_tokens / 1_000_000) * CONFIG.output_cost_per_million
-        total_cost = input_cost + output_cost
-        
-        return (
-            f"💰 Total usage: {self.total_input_tokens:,} input + "
-            f"{self.total_output_tokens:,} output tokens = ${total_cost:.2f}"
-        )
+    def get_cost_summary(self, providers: list[ModelProvider]) -> str:
+        """Get total cost summary across all models."""
+        lines = ["💰 **Cost Summary**"]
+        grand_total = 0.0
+
+        for p in providers:
+            if p.total_requests == 0:
+                continue
+            cost = p.get_cost()
+            grand_total += cost
+            lines.append(
+                f"  **{p.name}**: {p.total_requests} requests, "
+                f"{p.total_input_tokens:,} in + {p.total_output_tokens:,} out = "
+                f"${cost:.4f}"
+            )
+
+        if grand_total == 0:
+            return "💰 No API calls made yet."
+
+        lines.append(f"\n  **Total**: ${grand_total:.4f}")
+        return "\n".join(lines)
     
-    def save_memories(self, filepath: str = "memories.json") -> None:
+    def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Save all memories to disk (synchronous - use save_memories_async in async contexts)."""
         data = {
             str(guild_id): memory.to_dict()
             for guild_id, memory in self.memories.items()
         }
+        data["_calibration"] = self.calibration.to_dict()
+        if providers:
+            data["_model_stats"] = {
+                p.name: p.to_stats_dict() for p in providers
+            }
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
         self._memories_dirty = False
     
-    async def save_memories_async(self, filepath: str = "memories.json") -> None:
+    async def save_memories_async(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Save memories without blocking the event loop."""
-        await asyncio.to_thread(self.save_memories, filepath)
+        await asyncio.to_thread(self.save_memories, filepath, providers)
     
     def mark_dirty(self) -> None:
         """Mark memories as needing to be saved."""
@@ -675,19 +845,35 @@ class ConversationManager:
         """Check if memories need saving."""
         return getattr(self, '_memories_dirty', False)
     
-    def load_memories(self, filepath: str = "memories.json") -> None:
+    def load_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Load memories from disk."""
         try:
             with open(filepath, 'r') as f:
                 data = json.load(f)
-            for guild_id_str, memory_data in data.items():
-                self.memories[int(guild_id_str)] = TwoTierMemory.from_dict(
-                    memory_data,
+
+            guild_count = 0
+            for key, value in data.items():
+                if key.startswith("_"):
+                    continue  # Skip metadata keys
+                self.memories[int(key)] = TwoTierMemory.from_dict(
+                    value,
                     max_working_notes=CONFIG.max_working_notes,
                     max_longterm_entries=CONFIG.max_longterm_memories,
                     working_decay_hours=CONFIG.working_memory_decay_hours
                 )
-            print(f"Loaded memories for {len(data)} guilds")
+                guild_count += 1
+
+            # Load calibration data
+            if "_calibration" in data:
+                self.calibration = CalibrationTracker.from_dict(data["_calibration"])
+
+            # Load model stats
+            if "_model_stats" in data and providers:
+                for p in providers:
+                    if p.name in data["_model_stats"]:
+                        p.load_stats(data["_model_stats"][p.name])
+
+            print(f"Loaded memories for {guild_count} guilds")
         except FileNotFoundError:
             print("No existing memories file, starting fresh")
 
@@ -701,32 +887,76 @@ class ClaudeBot(commands.Bot):
         intents.message_content = True  # PRIVILEGED INTENT - enable in portal!
         intents.guilds = True
         intents.guild_reactions = True  # For reaction handling
-        
+
         super().__init__(command_prefix="!", intents=intents)
-        
+
+        # Model providers
+        self.claude_provider = CLAUDE_PROVIDER
+        self.deepseek_provider = DEEPSEEK_PROVIDER
+
         # Anthropic client
-        self.claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if anthropic_key:
+            self.claude_client = anthropic.Anthropic(api_key=anthropic_key)
+            self.claude_provider.enabled = True
+            print(f"🟢 Claude enabled (model: {self.claude_provider.model_id})")
+        else:
+            self.claude_client = None
+            self.claude_provider.enabled = False
+            print("⚪ Claude not configured (ANTHROPIC_API_KEY missing)")
+
+        # Deepseek client (OpenAI-compatible, optional)
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+        if deepseek_key:
+            from openai import OpenAI
+            self.deepseek_client = OpenAI(
+                api_key=deepseek_key,
+                base_url="https://api.deepseek.com"
+            )
+            self.deepseek_provider.enabled = True
+            print(f"🟢 Deepseek enabled (model: {self.deepseek_provider.model_id})")
+        else:
+            self.deepseek_client = None
+            self.deepseek_provider.enabled = False
+            print("⚪ Deepseek not configured (DEEPSEEK_API_KEY missing)")
+
+        # All providers list (for iteration)
+        self.providers = [self.claude_provider, self.deepseek_provider]
+
         # Conversation manager
         self.manager = ConversationManager()
-        
+
+        # Per-channel model preferences
+        self.channel_preferences: dict[int, str] = {}
+
         # Allowed channels (load from config)
         self.allowed_channels: set[int] = set()
         self._load_config()
-    
+
+    @property
+    def multi_model_active(self) -> bool:
+        """True if more than one model is enabled."""
+        return sum(1 for p in self.providers if p.enabled) > 1
+
     def _load_config(self) -> None:
         """Load configuration from config.json."""
         try:
             with open('config.json', 'r') as f:
                 config = json.load(f)
                 self.allowed_channels = set(config.get('allowed_channels', []))
+                CONFIG.default_model = config.get('default_model', 'auto')
+                # Load channel preferences
+                for ch_id_str, model_name in config.get('channel_preferences', {}).items():
+                    self.channel_preferences[int(ch_id_str)] = model_name
                 print(f"Loaded {len(self.allowed_channels)} allowed channels")
+                if CONFIG.default_model != "auto":
+                    print(f"   Default model: {CONFIG.default_model}")
         except FileNotFoundError:
             print("⚠️  No config.json found! Create one with {'allowed_channels': [channel_ids]}")
-    
+
     async def setup_hook(self) -> None:
         """Called when bot is ready."""
-        self.manager.load_memories()
+        self.manager.load_memories(providers=self.providers)
         # Start background save task
         self._save_task = self.loop.create_task(self._periodic_save())
     
@@ -736,23 +966,24 @@ class ClaudeBot(commands.Bot):
         while not self.is_closed():
             try:
                 if self.manager.needs_save:
-                    await self.manager.save_memories_async()
+                    await self.manager.save_memories_async(providers=self.providers)
                     print("💾 Memories saved (background)")
             except Exception as e:
                 print(f"⚠️  Error saving memories: {e}")
             await asyncio.sleep(60)  # Check every 60 seconds
-    
+
     async def close(self) -> None:
         """Clean shutdown - save memories before closing."""
         if self.manager.needs_save:
             print("💾 Saving memories before shutdown...")
-            await self.manager.save_memories_async()
+            await self.manager.save_memories_async(providers=self.providers)
         await super().close()
-    
+
     async def on_ready(self) -> None:
         print(f"✅ Logged in as {self.user}")
         print(f"📋 Allowed channels: {self.allowed_channels}")
-        print(f"🧠 Model: {CONFIG.model}")
+        models = [p.name for p in self.providers if p.enabled]
+        print(f"🧠 Models: {', '.join(models)} (selection: {CONFIG.default_model})")
     
     async def on_message(self, message: discord.Message) -> None:
         # Ignore self
@@ -785,31 +1016,66 @@ class ClaudeBot(commands.Bot):
         
         # Get or create thread
         thread, is_new_thread = await self._ensure_thread(message)
-        
+
+        # Select which model responds
+        provider = await self._select_model(message, message.guild.id)
+
         # Generate response
         async with thread.typing():
             response, reactions = await self._generate_response(
-                thread, 
+                thread,
                 message.guild.id,
-                initial_message=message if is_new_thread else None
+                initial_message=message if is_new_thread else None,
+                provider=provider,
             )
-        
-        # Handle reactions first
+
+        # Label the response with model name (only when multi-model is active)
+        if self.multi_model_active:
+            response = f"**[{provider.name}]** {response}"
+
+        # Handle reactions
         for emoji in reactions:
             try:
                 await message.add_reaction(emoji)
             except discord.HTTPException:
-                pass  # Emoji not found or can't react
-        
+                pass
+
         # Extract and handle code files
         response, files = self._extract_code_files(response)
-        
+
         # Send response (handle Discord's 2000 char limit)
         await self._send_response(thread, response, files)
-        
+
+        # Record calibration bid
+        confidence = self._estimate_confidence(message.content or "", provider)
+        record_idx = self.manager.calibration.record_bid(provider.name, confidence)
+        self.manager.last_response_model[thread.id] = provider.name
+        self.manager.last_response_index[thread.id] = record_idx
+
         # Mark memories as needing save (actual save happens in background task)
         self.manager.mark_dirty()
     
+    async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User) -> None:
+        """Track user feedback on bot responses for calibration."""
+        if user == self.user:
+            return
+        if reaction.message.author != self.user:
+            return
+
+        channel_id = reaction.message.channel.id
+        if channel_id not in self.manager.last_response_index:
+            return
+
+        emoji = str(reaction.emoji)
+        if emoji in ('\U0001f44d', '\u2764\ufe0f', '\U0001f525', '\u2705'):  # thumbs up, heart, fire, check
+            self.manager.calibration.record_feedback(
+                self.manager.last_response_index[channel_id], "good"
+            )
+        elif emoji in ('\U0001f44e', '\u274c', '\U0001f615'):  # thumbs down, x, confused
+            self.manager.calibration.record_feedback(
+                self.manager.last_response_index[channel_id], "bad"
+            )
+
     async def _ensure_thread(self, message: discord.Message) -> tuple[discord.Thread, bool]:
         """Get existing thread or create new one. Returns (thread, is_new)."""
         if isinstance(message.channel, discord.Thread):
@@ -825,37 +1091,230 @@ class ClaudeBot(commands.Bot):
             f"Commands: `!help` for full list"
         )
         return thread, True
-    
-    async def _generate_response(
-        self, 
-        channel: discord.abc.Messageable, 
+
+    # ----- Multi-model support methods -----
+
+    def _strip_images_from_messages(self, messages: list[dict]) -> list[dict]:
+        """Remove image content from messages for text-only models like Deepseek."""
+        stripped = []
+        for msg in messages:
+            content = msg["content"]
+            if isinstance(content, str):
+                stripped.append(msg)
+            elif isinstance(content, list):
+                text_parts = [b for b in content if b.get("type") == "text"]
+                if text_parts:
+                    if len(text_parts) == 1:
+                        stripped.append({"role": msg["role"], "content": text_parts[0]["text"]})
+                    else:
+                        stripped.append({"role": msg["role"], "content": text_parts})
+                elif any(b.get("type") == "image" for b in content):
+                    stripped.append({"role": msg["role"], "content": "[An image was shared]"})
+            else:
+                stripped.append(msg)
+        return stripped
+
+    def _convert_messages_to_openai_format(self, messages: list[dict]) -> list[dict]:
+        """Convert Anthropic-format messages to OpenAI chat format."""
+        converted = []
+        for msg in messages:
+            content = msg["content"]
+            if isinstance(content, str):
+                converted.append({"role": msg["role"], "content": content})
+            elif isinstance(content, list):
+                parts = []
+                for block in content:
+                    if block.get("type") == "text":
+                        parts.append({"type": "text", "text": block["text"]})
+                    elif block.get("type") == "image":
+                        source = block.get("source", {})
+                        media_type = source.get("media_type", "image/png")
+                        data = source.get("data", "")
+                        parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media_type};base64,{data}"}
+                        })
+                if parts:
+                    converted.append({"role": msg["role"], "content": parts})
+            else:
+                converted.append(msg)
+        return converted
+
+    def _build_system_prompt(self, provider: ModelProvider) -> str:
+        """Build system prompt tailored to the provider."""
+        if provider.name == "Claude":
+            identity = "Claude, an AI assistant made by Anthropic"
+        elif provider.name == "Deepseek":
+            identity = "Deepseek, an AI assistant made by DeepSeek"
+        else:
+            identity = f"{provider.name}, an AI assistant"
+        return CONFIG.system_prompt.replace("{model_identity}", identity)
+
+    def _estimate_confidence(self, message_text: str, provider: ModelProvider) -> float:
+        """
+        Estimate how well-suited a model is for this message.
+        Returns 0.0-1.0. This is a heuristic, NOT an LLM call.
+        """
+        score = 0.5
+        text_lower = message_text.lower()
+        word_count = len(message_text.split())
+
+        if provider.name == "Claude":
+            # Claude excels at: complex questions, code review, nuance, creative, analysis
+            if word_count > 100:
+                score += 0.15
+            if any(kw in text_lower for kw in [
+                'explain', 'analyze', 'compare', 'review', 'design',
+                'architecture', 'tradeoff', 'nuance', 'creative', 'write'
+            ]):
+                score += 0.1
+            if any(kw in text_lower for kw in [
+                'code', 'debug', 'refactor', 'implement', 'function',
+                'class', 'algorithm', 'bug', 'error'
+            ]):
+                score += 0.1
+            if '```' in message_text:
+                score += 0.1
+            # Cost penalty - Claude must "earn" selection
+            score -= 0.2
+
+        elif provider.name == "Deepseek":
+            # Deepseek excels at: quick answers, factual, simple code, casual chat
+            if word_count < 30:
+                score += 0.15
+            if any(kw in text_lower for kw in [
+                'what is', 'how do', 'define', 'translate', 'list',
+                'name', 'when', 'where', 'who', 'quick'
+            ]):
+                score += 0.1
+            if '?' in message_text and word_count < 20:
+                score += 0.1
+            # Cost bonus - cheap = preferred for routine tasks
+            score += 0.15
+
+        return max(0.0, min(1.0, score))
+
+    async def _select_model(self, message: discord.Message, guild_id: int) -> ModelProvider:
+        """Select which model should respond to this message."""
+        # Hard rule: only Claude can handle images
+        has_images = any(
+            any(a.filename.lower().endswith(ext) for ext in CONFIG.image_types)
+            for a in message.attachments
+        )
+        if has_images and self.claude_provider.enabled:
+            return self.claude_provider
+
+        # Only one model available?
+        if not self.deepseek_provider.enabled:
+            return self.claude_provider
+        if not self.claude_provider.enabled:
+            return self.deepseek_provider
+
+        # User preference for this channel?
+        channel_id = message.channel.id
+        parent_id = getattr(message.channel, 'parent_id', None)
+        pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
+        if pref == "claude":
+            return self.claude_provider
+        elif pref == "deepseek":
+            return self.deepseek_provider
+
+        # Global default override?
+        if CONFIG.default_model == "claude":
+            return self.claude_provider
+        elif CONFIG.default_model == "deepseek":
+            return self.deepseek_provider
+
+        # Auto-select via confidence heuristic
+        text = message.content or ""
+        claude_score = self._estimate_confidence(text, self.claude_provider)
+        deepseek_score = self._estimate_confidence(text, self.deepseek_provider)
+
+        # Prefer cheaper model when close
+        if claude_score > deepseek_score + 0.05:
+            return self.claude_provider
+        else:
+            return self.deepseek_provider
+
+    async def _generate_deepseek_response(
+        self,
         guild_id: int,
-        initial_message: discord.Message = None
+        messages: list[dict],
+        system: str,
+    ) -> tuple[str, list[str]]:
+        """Generate response using Deepseek. Returns (text, reactions)."""
+        # Convert to OpenAI format and strip images
+        openai_messages = self._strip_images_from_messages(messages)
+        openai_messages = self._convert_messages_to_openai_format(openai_messages)
+
+        # Prepend system message (OpenAI uses it as first message)
+        openai_messages.insert(0, {"role": "system", "content": system})
+
+        try:
+            response = await asyncio.to_thread(
+                self.deepseek_client.chat.completions.create,
+                model=self.deepseek_provider.model_id,
+                max_tokens=self.deepseek_provider.max_tokens,
+                messages=openai_messages,
+            )
+
+            # Track usage
+            usage = response.usage
+            self.deepseek_provider.total_input_tokens += usage.prompt_tokens
+            self.deepseek_provider.total_output_tokens += usage.completion_tokens
+            self.deepseek_provider.total_requests += 1
+
+            response_text = response.choices[0].message.content or ""
+
+            # Process notes and reactions (same patterns as Claude)
+            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
+            for match in re.finditer(note_pattern, response_text):
+                key = match.group(1).strip()
+                value = match.group(2).strip()
+                self.manager.memories[guild_id].working.add(key, value)
+            response_text = re.sub(note_pattern, '', response_text)
+
+            reactions = []
+            reaction_pattern = r'\[react:\s*([^\]]+)\]'
+            for match in re.finditer(reaction_pattern, response_text):
+                reactions.append(match.group(1).strip())
+            response_text = re.sub(reaction_pattern, '', response_text).strip()
+            response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)
+            response_text = re.sub(r'  +', ' ', response_text)
+
+            return response_text, reactions
+
+        except Exception as e:
+            return f"Deepseek Error: {e}", []
+
+    async def _generate_response(
+        self,
+        channel: discord.abc.Messageable,
+        guild_id: int,
+        initial_message: discord.Message = None,
+        provider: ModelProvider = None,
     ) -> tuple[str, list[str]]:
         """
-        Generate Claude response.
+        Generate response from the selected model provider.
         Returns (response_text, list_of_emoji_reactions)
         Also processes [note: key: value] tags for working memory.
-        
-        If initial_message is provided, it's prepended to the conversation
-        (used when a new thread is created and the starter message isn't in history).
         """
+        if provider is None:
+            provider = self.claude_provider
+
         # Fetch conversation from Discord
         messages = await self.manager.fetch_thread_history(channel)
-        
+
         # If this is a new thread, the triggering message isn't in thread history
-        # We need to prepend it manually
         if initial_message:
             content_parts = []
-            
-            # Add text
+
             if initial_message.content:
                 content_parts.append({
                     "type": "text",
                     "text": f"{initial_message.author.display_name}: {initial_message.content}"
                 })
-            
-            # Add images if present
+
             for attachment in initial_message.attachments:
                 if any(attachment.filename.lower().endswith(ext) for ext in CONFIG.image_types):
                     if attachment.size <= CONFIG.max_image_size_mb * 1024 * 1024:
@@ -865,7 +1324,7 @@ class ClaudeBot(commands.Bot):
                                 ext = attachment.filename.lower().split('.')[-1]
                                 media_type = {
                                     'png': 'image/png',
-                                    'jpg': 'image/jpeg', 
+                                    'jpg': 'image/jpeg',
                                     'jpeg': 'image/jpeg',
                                     'gif': 'image/gif',
                                     'webp': 'image/webp'
@@ -880,10 +1339,9 @@ class ClaudeBot(commands.Bot):
                                 })
                         except Exception:
                             pass
-                
-                # Handle text files
+
                 elif any(attachment.filename.lower().endswith(ext) for ext in CONFIG.text_file_types):
-                    if attachment.size <= 1024 * 1024:  # 1MB limit
+                    if attachment.size <= 1024 * 1024:
                         try:
                             file_content = await self.manager._fetch_text_file(attachment.url)
                             if file_content:
@@ -893,30 +1351,29 @@ class ClaudeBot(commands.Bot):
                                 })
                         except Exception:
                             pass
-            
+
             if content_parts:
-                # Simplify if just text
                 if len(content_parts) == 1 and content_parts[0]["type"] == "text":
                     messages.insert(0, {"role": "user", "content": content_parts[0]["text"]})
                 else:
                     messages.insert(0, {"role": "user", "content": content_parts})
-        
+
         if not messages:
             return "I don't see any messages to respond to!", []
-        
+
         # Build system prompt with all context sources
-        system_parts = [CONFIG.system_prompt]
-        
+        system_parts = [self._build_system_prompt(provider)]
+
         # 1. Thread index (READ-ONLY - prevents feedback loops)
         thread_index = await self.manager.fetch_thread_index(channel)
         if thread_index:
             system_parts.append(thread_index)
-        
+
         # 2. Memory (both tiers)
         memory_context = self.manager.memories[guild_id].get_context_string()
         if memory_context:
             system_parts.append(memory_context)
-        
+
         # 3. Gentle nudge if working memory is sparse
         working_note_count = len(self.manager.memories[guild_id].working.notes)
         if working_note_count < 3:
@@ -925,57 +1382,56 @@ class ClaudeBot(commands.Bot):
                 "If anything noteworthy comes up in this conversation, "
                 "jot it down with [note: key: value].*"
             )
-        
+
         system = "\n\n".join(system_parts)
-        
+
+        # Dispatch to the appropriate model
+        if provider.name == "Deepseek":
+            return await self._generate_deepseek_response(guild_id, messages, system)
+
+        # Claude path (default)
         try:
-            # Run in thread pool so we don't block Discord's event loop
             response = await asyncio.to_thread(
-                self.claude.messages.create,
-                model=CONFIG.model,
-                max_tokens=CONFIG.max_tokens,
+                self.claude_client.messages.create,
+                model=self.claude_provider.model_id,
+                max_tokens=self.claude_provider.max_tokens,
                 system=system,
                 messages=messages
             )
-            
+
             # Track usage
-            self.manager.total_input_tokens += response.usage.input_tokens
-            self.manager.total_output_tokens += response.usage.output_tokens
-            
-            # Handle empty response
+            self.claude_provider.total_input_tokens += response.usage.input_tokens
+            self.claude_provider.total_output_tokens += response.usage.output_tokens
+            self.claude_provider.total_requests += 1
+
             if not response.content:
                 return "I received an empty response from the API.", []
-            
+
             response_text = response.content[0].text if hasattr(response.content[0], 'text') else str(response.content[0])
-            
+
             # Extract and process working memory notes
             note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
             for match in re.finditer(note_pattern, response_text):
                 key = match.group(1).strip()
                 value = match.group(2).strip()
                 self.manager.memories[guild_id].working.add(key, value)
-            
-            # Remove note markers from visible response
             response_text = re.sub(note_pattern, '', response_text)
-            
-            # Extract reactions from response
+
+            # Extract reactions
             reactions = []
             reaction_pattern = r'\[react:\s*([^\]]+)\]'
             for match in re.finditer(reaction_pattern, response_text):
-                emoji = match.group(1).strip()
-                reactions.append(emoji)
-            
-            # Remove reaction markers from visible response
+                reactions.append(match.group(1).strip())
             response_text = re.sub(reaction_pattern, '', response_text).strip()
-            
-            # Clean up any double spaces or weird formatting from removed tags
+
+            # Clean up formatting
             response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)
             response_text = re.sub(r'  +', ' ', response_text)
-            
+
             return response_text, reactions
-            
+
         except anthropic.APIError as e:
-            return f"❌ API Error: {e}", []
+            return f"Claude Error: {e}", []
     
     async def _web_search(
         self, 
@@ -1000,11 +1456,11 @@ class ClaudeBot(commands.Bot):
         messages = [{"role": "user", "content": query}]
         
         try:
-            # Initial request with web search tool (run in thread pool)
+            # Web search always uses Claude (has built-in web search tool)
             response = await asyncio.to_thread(
-                self.claude.messages.create,
-                model=CONFIG.model,
-                max_tokens=CONFIG.max_tokens,
+                self.claude_client.messages.create,
+                model=self.claude_provider.model_id,
+                max_tokens=self.claude_provider.max_tokens,
                 system=system,
                 messages=messages,
                 tools=[{
@@ -1012,47 +1468,41 @@ class ClaudeBot(commands.Bot):
                     "name": "web_search"
                 }]
             )
-            
+
             # Track usage
-            self.manager.total_input_tokens += response.usage.input_tokens
-            self.manager.total_output_tokens += response.usage.output_tokens
-            
+            self.claude_provider.total_input_tokens += response.usage.input_tokens
+            self.claude_provider.total_output_tokens += response.usage.output_tokens
+            self.claude_provider.total_requests += 1
+
             # Collect all sources for embeds
             sources = []
             final_text = ""
-            
+
             # Process response - may need multiple rounds if tool_use
             while response.stop_reason == "tool_use":
-                # Find the tool use block
                 tool_use_block = None
                 for block in response.content:
                     if block.type == "tool_use":
                         tool_use_block = block
                         break
-                
+
                 if not tool_use_block:
                     break
-                
-                # The API handles the actual search - we just continue the conversation
-                # Add assistant's response (with tool use) to messages
+
                 messages.append({"role": "assistant", "content": response.content})
-                
-                # Add a tool result (the API handles the actual search internally)
-                # For web_search, we don't need to provide results - it's server-side
                 messages.append({
-                    "role": "user", 
+                    "role": "user",
                     "content": [{
                         "type": "tool_result",
                         "tool_use_id": tool_use_block.id,
                         "content": "Search completed."
                     }]
                 })
-                
-                # Continue the conversation (run in thread pool)
+
                 response = await asyncio.to_thread(
-                    self.claude.messages.create,
-                    model=CONFIG.model,
-                    max_tokens=CONFIG.max_tokens,
+                    self.claude_client.messages.create,
+                    model=self.claude_provider.model_id,
+                    max_tokens=self.claude_provider.max_tokens,
                     system=system,
                     messages=messages,
                     tools=[{
@@ -1060,10 +1510,9 @@ class ClaudeBot(commands.Bot):
                         "name": "web_search"
                     }]
                 )
-                
-                # Track additional usage
-                self.manager.total_input_tokens += response.usage.input_tokens
-                self.manager.total_output_tokens += response.usage.output_tokens
+
+                self.claude_provider.total_input_tokens += response.usage.input_tokens
+                self.claude_provider.total_output_tokens += response.usage.output_tokens
             
             # Extract final text response
             for block in response.content:
@@ -1181,7 +1630,7 @@ class ClaudeBot(commands.Bot):
             await message.channel.send(info)
         
         elif cmd == "!cost":
-            summary = self.manager.get_cost_summary()
+            summary = self.manager.get_cost_summary(self.providers)
             await message.channel.send(summary)
         
         elif cmd == "!memories":
@@ -1228,7 +1677,7 @@ class ClaudeBot(commands.Bot):
                 key = parts[1]
                 value = parts[2]
                 if memory.longterm.add(key, value):
-                    self.manager.save_memories()
+                    self.manager.save_memories(providers=self.providers)
                     await message.channel.send(f"✅ Remembered `{key}` (permanent)")
                 else:
                     await message.channel.send(
@@ -1243,10 +1692,10 @@ class ClaudeBot(commands.Bot):
                 key = parts[1]
                 # Try long-term first, then working
                 if memory.longterm.remove(key):
-                    self.manager.save_memories()
+                    self.manager.save_memories(providers=self.providers)
                     await message.channel.send(f"✅ Forgot `{key}` from long-term memory")
                 elif memory.working.remove(key):
-                    self.manager.save_memories()
+                    self.manager.save_memories(providers=self.providers)
                     await message.channel.send(f"✅ Forgot `{key}` from working notes")
                 else:
                     await message.channel.send(f"❓ No memory with key `{key}`")
@@ -1260,7 +1709,7 @@ class ClaudeBot(commands.Bot):
                 if key not in memory.working.notes:
                     await message.channel.send(f"❓ No working note with key `{key}`")
                 elif memory.promote(key):
-                    self.manager.save_memories()
+                    self.manager.save_memories(providers=self.providers)
                     await message.channel.send(f"✅ Promoted `{key}` to long-term memory (permanent)")
                 else:
                     await message.channel.send(
@@ -1279,7 +1728,10 @@ class ClaudeBot(commands.Bot):
                 await message.channel.send("📭 No other threads found in this channel.")
         
         elif cmd == "!search":
-            # Web search with Claude
+            # Web search requires Claude (has built-in web search tool)
+            if not self.claude_provider.enabled:
+                await message.channel.send("❌ Web search requires Claude (ANTHROPIC_API_KEY not configured).")
+                return
             if len(parts) >= 2:
                 # Get the full query (everything after !search)
                 query = message.content[8:].strip()  # len("!search ") = 8
@@ -1318,7 +1770,7 @@ class ClaudeBot(commands.Bot):
                 key = parts[1]
                 summary = parts[2]
                 if memory.longterm.add(f"thread_{key}", summary):
-                    self.manager.save_memories()
+                    self.manager.save_memories(providers=self.providers)
                     await message.channel.send(f"✅ Saved thread summary as `thread_{key}`")
                 else:
                     await message.channel.send(
@@ -1326,6 +1778,9 @@ class ClaudeBot(commands.Bot):
                     )
             elif len(parts) == 2:
                 # !summarize <key> - ask Claude to generate summary
+                if not self.claude_provider.enabled:
+                    await message.channel.send("❌ Auto-summarize requires Claude (ANTHROPIC_API_KEY not configured).")
+                    return
                 key = parts[1]
                 await message.channel.send(f"📝 Generating summary for this thread as `thread_{key}`...")
                 
@@ -1341,20 +1796,21 @@ class ClaudeBot(commands.Bot):
                         
                         # Ask Claude to summarize (run in thread pool)
                         summary_response = await asyncio.to_thread(
-                            self.claude.messages.create,
-                            model=CONFIG.model,
+                            self.claude_client.messages.create,
+                            model=self.claude_provider.model_id,
                             max_tokens=200,
                             system="Summarize this conversation in 1-2 sentences. Focus on the key topic and any decisions/outcomes. Be concise.",
                             messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
                         summary = summary_response.content[0].text.strip()
-                        
+
                         # Track usage
-                        self.manager.total_input_tokens += summary_response.usage.input_tokens
-                        self.manager.total_output_tokens += summary_response.usage.output_tokens
+                        self.claude_provider.total_input_tokens += summary_response.usage.input_tokens
+                        self.claude_provider.total_output_tokens += summary_response.usage.output_tokens
+                        self.claude_provider.total_requests += 1
                         
                         if memory.longterm.add(f"thread_{key}", summary):
-                            self.manager.save_memories()
+                            self.manager.save_memories(providers=self.providers)
                             await message.channel.send(f"✅ Saved: `thread_{key}`: {summary}")
                         else:
                             await message.channel.send(
@@ -1372,14 +1828,86 @@ class ClaudeBot(commands.Bot):
                     "`!summarize <key> <your summary>` - Save your own summary"
                 )
         
+        elif cmd == "!models":
+            lines = ["🤖 **Available Models**"]
+            for p in self.providers:
+                status = "🟢 Enabled" if p.enabled else "⚪ Disabled"
+                cost = p.get_cost()
+                if p.total_requests > 0:
+                    lines.append(
+                        f"  **{p.name}** ({p.model_id}) - {status}, "
+                        f"{p.total_requests} requests, ${cost:.4f}"
+                    )
+                else:
+                    lines.append(f"  **{p.name}** ({p.model_id}) - {status}")
+
+            mode = CONFIG.default_model
+            channel_id = message.channel.id
+            parent_id = getattr(message.channel, 'parent_id', None)
+            ch_pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
+            if ch_pref:
+                lines.append(f"\n  **This channel**: {ch_pref}")
+            lines.append(f"  **Selection mode**: {mode}")
+            await self._send_response(message.channel, "\n".join(lines))
+
+        elif cmd == "!prefer":
+            if len(parts) >= 2:
+                pref = parts[1].lower()
+                if pref not in ("claude", "deepseek", "auto"):
+                    await message.channel.send("Usage: `!prefer [claude|deepseek|auto]`")
+                    return
+                channel_id = message.channel.id
+                # Use parent channel for threads
+                if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                    channel_id = message.channel.parent_id
+                if pref == "auto":
+                    self.channel_preferences.pop(channel_id, None)
+                    await message.channel.send("✅ This channel will use **automatic** model selection.")
+                elif pref == "deepseek" and not self.deepseek_provider.enabled:
+                    await message.channel.send("❌ Deepseek is not configured (no API key).")
+                elif pref == "claude" and not self.claude_provider.enabled:
+                    await message.channel.send("❌ Claude is not configured (no API key).")
+                else:
+                    self.channel_preferences[channel_id] = pref
+                    await message.channel.send(f"✅ This channel will always use **{pref.title()}**.")
+            else:
+                channel_id = message.channel.id
+                parent_id = getattr(message.channel, 'parent_id', None)
+                pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id, "auto")
+                await message.channel.send(
+                    f"Current preference: **{pref}**\n"
+                    f"Usage: `!prefer [claude|deepseek|auto]`"
+                )
+
+        elif cmd == "!calibration":
+            model_name = parts[1].title() if len(parts) >= 2 else None
+            models = [model_name] if model_name else [p.name for p in self.providers if p.enabled]
+            lines = ["📊 **Calibration Data**"]
+            for name in models:
+                summary = self.manager.calibration.get_calibration_summary(name)
+                lines.append(f"\n  **{name}** ({summary['total']} bids, {summary['rated']} rated):")
+                if summary['buckets']:
+                    for bucket, data in summary['buckets'].items():
+                        pct = int(data['success_rate'] * 100)
+                        lines.append(f"    {bucket}: {data['count']} rated, {pct}% positive")
+                else:
+                    lines.append("    No feedback yet. React with 👍/👎 to bot responses!")
+            await self._send_response(message.channel, "\n".join(lines))
+
         elif cmd == "!help":
             help_text = """
 **Commands:**
 `!context` - Show current context size and cost estimate
-`!cost` - Show total API usage and cost
+`!cost` - Show total API usage and cost per model
 `!memories` - List all memories (both types)
 `!threads` - Show other recent threads in this channel
-`!search <query>` - 🔍 Web search (costs extra, ~$0.01-0.03)
+`!search <query>` - Web search (costs extra, ~$0.01-0.03)
+
+**Multi-model (Hydra):**
+`!models` - Show available models and their usage stats
+`!prefer [claude|deepseek|auto]` - Set model preference for this channel
+`!calibration` - Show model confidence calibration stats
+React with 👍/👎 to bot responses to improve model selection
 
 **Long-term memory (permanent):**
 `!remember <key> <value>` - Store a permanent memory
@@ -1388,7 +1916,7 @@ class ClaudeBot(commands.Bot):
 `!summarize <key> <summary>` - Save your own thread summary
 
 **Working memory (auto-managed):**
-Claude automatically jots down notes during conversation.
+The AI automatically jots down notes during conversation.
 These fade after ~48h if not relevant, or stick around if referenced.
 `!keep <key>` - Promote a working note to permanent memory
 
@@ -1398,12 +1926,13 @@ These fade after ~48h if not relevant, or stick around if referenced.
 🔴 Almost gone (<30% life)
 
 **Features:**
-📷 Upload images and I can see them
+📷 Upload images and I can see them (Claude only)
 💬 I respond in threads (one channel, multiple convos)
 📎 Long code blocks become file attachments
 😀 I can react to your messages with emoji
 🧵 I can see other threads for context
-🔍 Web search with citations
+🔍 Web search with citations (Claude only)
+🐉 Multi-model: Claude + Deepseek with smart routing
             """
             await message.channel.send(help_text)
 
@@ -1416,10 +1945,10 @@ def main():
     if not os.getenv("DISCORD_TOKEN"):
         print("❌ DISCORD_TOKEN not set in environment!")
         return
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("❌ ANTHROPIC_API_KEY not set in environment!")
+    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("DEEPSEEK_API_KEY"):
+        print("❌ At least one API key required: ANTHROPIC_API_KEY or DEEPSEEK_API_KEY")
         return
-    
+
     bot = ClaudeBot()
     bot.run(os.getenv("DISCORD_TOKEN"))
 
