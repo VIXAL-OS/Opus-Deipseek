@@ -666,9 +666,14 @@ class ConversationManager:
             # Add text if present
             if msg.content:
                 author_prefix = "" if msg.author.bot else f"{msg.author.display_name}: "
+                text = msg.content
+                # Strip model labels from our own messages to prevent accumulation
+                # e.g., "**[Deepseek]** hello" -> "hello"
+                if msg.author.bot:
+                    text = re.sub(r'^(\*\*\[(?:Claude|Deepseek)\]\*\*\s*)+', '', text)
                 content.append({
                     "type": "text",
-                    "text": f"{author_prefix}{msg.content}"
+                    "text": f"{author_prefix}{text}"
                 })
             
             # Add images if present
