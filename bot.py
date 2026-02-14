@@ -1307,6 +1307,14 @@ class ClaudeBot(commands.Bot):
         except Exception as e:
             return f"Search error: {e}"
 
+    @staticmethod
+    def _has_cjk(text: str) -> bool:
+        """Check if text contains Chinese/Japanese/Korean characters."""
+        return any('\u4e00' <= c <= '\u9fff'  # CJK Unified Ideographs
+                   or '\u3400' <= c <= '\u4dbf'  # CJK Extension A
+                   or '\uf900' <= c <= '\ufaff'  # CJK Compatibility Ideographs
+                   for c in text)
+
     def _estimate_confidence(self, message_text: str, provider: ModelProvider) -> float:
         """
         Estimate how well-suited a model is for this message.
@@ -1315,6 +1323,7 @@ class ClaudeBot(commands.Bot):
         score = 0.5
         text_lower = message_text.lower()
         word_count = len(message_text.split())
+        has_cjk = self._has_cjk(message_text)
 
         if provider.name == "Claude":
             # Claude excels at: complex questions, code review, nuance, creative, analysis
@@ -1332,20 +1341,27 @@ class ClaudeBot(commands.Bot):
                 score += 0.1
             if '```' in message_text:
                 score += 0.1
+            # CJK penalty - Deepseek is stronger here
+            if has_cjk:
+                score -= 0.15
             # Cost penalty - Claude must "earn" selection
             score -= 0.2
 
         elif provider.name == "Deepseek":
-            # Deepseek excels at: quick answers, factual, simple code, casual chat
+            # Deepseek excels at: quick answers, factual, simple code, casual chat, CJK languages
             if word_count < 30:
                 score += 0.15
             if any(kw in text_lower for kw in [
                 'what is', 'how do', 'define', 'translate', 'list',
-                'name', 'when', 'where', 'who', 'quick'
+                'name', 'when', 'where', 'who', 'quick',
+                'mandarin', 'chinese', '中文'
             ]):
                 score += 0.1
             if '?' in message_text and word_count < 20:
                 score += 0.1
+            # CJK bonus - trained on deeper Chinese internet data
+            if has_cjk:
+                score += 0.2
             # Cost bonus - cheap = preferred for routine tasks
             score += 0.15
 
