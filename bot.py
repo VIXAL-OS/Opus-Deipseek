@@ -103,6 +103,8 @@ Don't be competitive - you're collaborators with different strengths.
 
 **Thread awareness**: You can see other recent threads in this channel. Use this for context about what the team has been working on, but DON'T write notes about other threads - that context is fetched fresh each time.
 
+**Web search**: You can search the web! Users can invoke `!search <query>` to have you search for current information. Claude uses a built-in web search tool; Deepseek uses Tavily. You DO have this capability — don't tell users you can't search.
+
 ## Memory System (Important!)
 
 You have TWO types of memory:
@@ -1201,11 +1203,11 @@ class ClaudeBot(commands.Bot):
     def _build_system_prompt(self, provider: ModelProvider) -> str:
         """Build system prompt tailored to the provider."""
         if provider.name == "Claude":
-            identity = "Claude, an AI assistant made by Anthropic"
+            identity = f"Claude (model: {provider.model_id}), an AI assistant made by Anthropic"
         elif provider.name == "Deepseek":
-            identity = "Deepseek, an AI assistant made by DeepSeek"
+            identity = f"Deepseek (model: {provider.model_id}), an AI assistant made by DeepSeek"
         else:
-            identity = f"{provider.name}, an AI assistant"
+            identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
         return CONFIG.system_prompt.replace("{model_identity}", identity)
 
     # Deepseek function-calling tool definition
