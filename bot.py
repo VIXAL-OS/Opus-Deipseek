@@ -1120,6 +1120,8 @@ class ClaudeBot(commands.Bot):
 
         # Label the response with model name (only when multi-model is active)
         if self.multi_model_active:
+            # Strip any label the model echoed in its own response before adding the real one
+            response = re.sub(r'^(?:\*\*\[(Claude|Deepseek)\]\*\*\s*|\[(Claude|Deepseek)\]\s*)+', '', response)
             response = f"**[{provider.name}]** {response}"
 
         # Handle reactions
