@@ -703,10 +703,16 @@ class ConversationManager:
             if msg.content:
                 author_prefix = "" if msg.author.bot else f"{msg.author.display_name}: "
                 text = msg.content
-                # Strip model labels from our own messages to prevent accumulation
-                # e.g., "**[Deepseek]** hello" -> "hello"
+                # Convert bold model labels to plain text to prevent accumulation
+                # but KEEP the identity so models know who said what
+                # e.g., "**[Deepseek]** hello" -> "[Deepseek] hello" (not stripped entirely)
+                # Only the **bold** format accumulates; plain [brackets] are stable.
                 if msg.author.bot:
-                    text = re.sub(r'^(\*\*\[(?:Claude|Deepseek)\]\*\*\s*)+', '', text)
+                    # Find which model label is present, keep it as plain text
+                    label_match = re.match(r'^(\*\*\[(Claude|Deepseek)\]\*\*\s*)+', text)
+                    if label_match:
+                        model_label = label_match.group(2)  # Last captured model name
+                        text = f"[{model_label}] " + text[label_match.end():]
                 content.append({
                     "type": "text",
                     "text": f"{author_prefix}{text}"
