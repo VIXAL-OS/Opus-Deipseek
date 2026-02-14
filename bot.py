@@ -1010,20 +1010,37 @@ class ClaudeBot(commands.Bot):
         if channel_id not in self.allowed_channels and parent_id not in self.allowed_channels:
             return
         
-        # Handle commands
-        if message.content.startswith('!'):
+        # Check for direct model invocation (!claude / !deepseek)
+        forced_provider = None
+        content_lower = (message.content or "").lower()
+        if content_lower.startswith("!claude ") or content_lower == "!claude":
+            if not self.claude_provider.enabled:
+                await message.channel.send("❌ Claude is not configured (no API key).")
+                return
+            forced_provider = self.claude_provider
+            # Strip the !claude prefix from the message for the AI
+            message.content = message.content[len("!claude"):].strip()
+        elif content_lower.startswith("!deepseek ") or content_lower == "!deepseek":
+            if not self.deepseek_provider.enabled:
+                await message.channel.send("❌ Deepseek is not configured (no API key).")
+                return
+            forced_provider = self.deepseek_provider
+            message.content = message.content[len("!deepseek"):].strip()
+
+        # Handle commands (but not if we just consumed a model prefix)
+        if forced_provider is None and message.content.startswith('!'):
             await self._handle_command(message)
             return
-        
+
         # Ignore empty messages (no text, no attachments)
         if not message.content and not message.attachments:
             return
-        
+
         # Get or create thread
         thread, is_new_thread = await self._ensure_thread(message)
 
-        # Select which model responds
-        provider = await self._select_model(message, message.guild.id)
+        # Select which model responds (forced or auto)
+        provider = forced_provider or await self._select_model(message, message.guild.id)
 
         # Generate response
         async with thread.typing():
@@ -1909,6 +1926,8 @@ class ClaudeBot(commands.Bot):
 `!search <query>` - Web search (costs extra, ~$0.01-0.03)
 
 **Multi-model (Hydra):**
+`!claude <message>` - Force Claude to respond to this message
+`!deepseek <message>` - Force Deepseek to respond to this message
 `!models` - Show available models and their usage stats
 `!prefer [claude|deepseek|auto]` - Set model preference for this channel
 `!calibration` - Show model confidence calibration stats
