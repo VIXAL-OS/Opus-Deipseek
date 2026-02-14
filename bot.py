@@ -944,6 +944,16 @@ class ClaudeBot(commands.Bot):
             self.deepseek_provider.enabled = False
             print("⚪ Deepseek not configured (DEEPSEEK_API_KEY missing)")
 
+        # Tavily search client (optional - enables web search for Deepseek)
+        tavily_key = os.getenv("TAVILY_API_KEY")
+        if tavily_key:
+            from tavily import TavilyClient
+            self.tavily_client = TavilyClient(api_key=tavily_key)
+            print("🟢 Tavily web search enabled")
+        else:
+            self.tavily_client = None
+            print("⚪ Tavily not configured (Deepseek web search disabled)")
+
         # All providers list (for iteration)
         self.providers = [self.claude_provider, self.deepseek_provider]
 
@@ -1198,6 +1208,48 @@ class ClaudeBot(commands.Bot):
             identity = f"{provider.name}, an AI assistant"
         return CONFIG.system_prompt.replace("{model_identity}", identity)
 
+    # Deepseek function-calling tool definition
+    DEEPSEEK_TOOLS = [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information. Use this when you need up-to-date facts, news, or information you don't have.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }]
+
+    async def _tavily_search(self, query: str, max_results: int = 5) -> str:
+        """Perform a web search using Tavily. Returns formatted results string."""
+        if not self.tavily_client:
+            return "Web search is not available (no Tavily API key configured)."
+        try:
+            result = await asyncio.to_thread(
+                self.tavily_client.search,
+                query=query,
+                max_results=max_results
+            )
+            if not result.get("results"):
+                return f"No results found for: {query}"
+
+            lines = []
+            for r in result["results"]:
+                title = r.get("title", "Untitled")
+                url = r.get("url", "")
+                snippet = r.get("content", "")
+                lines.append(f"**{title}**\n{url}\n{snippet}\n")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Search error: {e}"
+
     def _estimate_confidence(self, message_text: str, provider: ModelProvider) -> float:
         """
         Estimate how well-suited a model is for this message.
@@ -1290,7 +1342,7 @@ class ClaudeBot(commands.Bot):
         messages: list[dict],
         system: str,
     ) -> tuple[str, list[str]]:
-        """Generate response using Deepseek. Returns (text, reactions)."""
+        """Generate response using Deepseek with optional tool calling. Returns (text, reactions)."""
         # Convert to OpenAI format and strip images
         openai_messages = self._strip_images_from_messages(messages)
         openai_messages = self._convert_messages_to_openai_format(openai_messages)
@@ -1298,19 +1350,70 @@ class ClaudeBot(commands.Bot):
         # Prepend system message (OpenAI uses it as first message)
         openai_messages.insert(0, {"role": "system", "content": system})
 
+        # Include web search tool if Tavily is available
+        tools = self.DEEPSEEK_TOOLS if self.tavily_client else None
+
         try:
+            api_kwargs = {
+                "model": self.deepseek_provider.model_id,
+                "max_tokens": self.deepseek_provider.max_tokens,
+                "messages": openai_messages,
+            }
+            if tools:
+                api_kwargs["tools"] = tools
+
             response = await asyncio.to_thread(
                 self.deepseek_client.chat.completions.create,
-                model=self.deepseek_provider.model_id,
-                max_tokens=self.deepseek_provider.max_tokens,
-                messages=openai_messages,
+                **api_kwargs,
             )
 
             # Track usage
-            usage = response.usage
-            self.deepseek_provider.total_input_tokens += usage.prompt_tokens
-            self.deepseek_provider.total_output_tokens += usage.completion_tokens
+            self.deepseek_provider.total_input_tokens += response.usage.prompt_tokens
+            self.deepseek_provider.total_output_tokens += response.usage.completion_tokens
             self.deepseek_provider.total_requests += 1
+
+            # Handle tool calls (max 3 rounds to prevent loops)
+            tool_rounds = 0
+            while response.choices[0].message.tool_calls and tool_rounds < 3:
+                tool_rounds += 1
+                assistant_msg = response.choices[0].message
+
+                # Add assistant message with tool calls to conversation
+                openai_messages.append({
+                    "role": "assistant",
+                    "content": assistant_msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                        }
+                        for tc in assistant_msg.tool_calls
+                    ]
+                })
+
+                # Execute each tool call
+                for tool_call in assistant_msg.tool_calls:
+                    if tool_call.function.name == "web_search":
+                        import json as _json
+                        args = _json.loads(tool_call.function.arguments)
+                        query = args.get("query", "")
+                        search_results = await self._tavily_search(query)
+                        openai_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": search_results,
+                        })
+
+                # Continue conversation with tool results
+                response = await asyncio.to_thread(
+                    self.deepseek_client.chat.completions.create,
+                    **api_kwargs,
+                )
+
+                # Track additional usage
+                self.deepseek_provider.total_input_tokens += response.usage.prompt_tokens
+                self.deepseek_provider.total_output_tokens += response.usage.completion_tokens
 
             response_text = response.choices[0].message.content or ""
 
@@ -1776,31 +1879,53 @@ class ClaudeBot(commands.Bot):
                 await message.channel.send("📭 No other threads found in this channel.")
         
         elif cmd == "!search":
-            # Web search requires Claude (has built-in web search tool)
-            if not self.claude_provider.enabled:
-                await message.channel.send("❌ Web search requires Claude (ANTHROPIC_API_KEY not configured).")
+            # Web search - available via Claude (native) or Deepseek (Tavily)
+            if not self.claude_provider.enabled and not self.tavily_client:
+                await message.channel.send("❌ Web search requires Claude (ANTHROPIC_API_KEY) or Tavily (TAVILY_API_KEY).")
                 return
             if len(parts) >= 2:
-                # Get the full query (everything after !search)
                 query = message.content[8:].strip()  # len("!search ") = 8
-                
+
                 await message.channel.send(f"🔍 Searching: *{query}*")
-                
-                async with message.channel.typing():
-                    response_text, embeds = await self._web_search(
-                        query, 
-                        message.channel,
-                        guild_id
-                    )
-                
-                # Send response (may need chunking)
-                await self._send_response(message.channel, response_text)
-                
-                # Send source embeds if any
-                for embed in embeds:
-                    await message.channel.send(embed=embed)
-                
-                # Show cost warning
+
+                # Determine which model handles the search
+                channel_id = message.channel.id
+                parent_id = getattr(message.channel, 'parent_id', None)
+                ch_pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
+
+                use_deepseek_search = (
+                    self.tavily_client
+                    and self.deepseek_provider.enabled
+                    and (ch_pref == "deepseek" or (not self.claude_provider.enabled))
+                )
+
+                if use_deepseek_search:
+                    # Deepseek + Tavily search
+                    async with message.channel.typing():
+                        search_results = await self._tavily_search(query)
+                        # Ask Deepseek to synthesize the results
+                        search_messages = [{"role": "user", "content": f"Based on these web search results, answer the query: {query}\n\nSearch results:\n{search_results}"}]
+                        response_text, _ = await self._generate_deepseek_response(
+                            guild_id, search_messages,
+                            "You are a helpful assistant. Summarize the search results clearly and cite your sources with URLs."
+                        )
+                    if self.multi_model_active:
+                        response_text = f"**[Deepseek]** {response_text}"
+                    await self._send_response(message.channel, response_text)
+                else:
+                    # Claude native web search
+                    async with message.channel.typing():
+                        response_text, embeds = await self._web_search(
+                            query,
+                            message.channel,
+                            guild_id
+                        )
+                    if self.multi_model_active:
+                        response_text = f"**[Claude]** {response_text}"
+                    await self._send_response(message.channel, response_text)
+                    for embed in embeds:
+                        await message.channel.send(embed=embed)
+
                 await message.channel.send(
                     f"*💡 Web search incurs additional token costs. Use `!cost` to check usage.*"
                 )
@@ -1949,7 +2074,7 @@ class ClaudeBot(commands.Bot):
 `!cost` - Show total API usage and cost per model
 `!memories` - List all memories (both types)
 `!threads` - Show other recent threads in this channel
-`!search <query>` - Web search (costs extra, ~$0.01-0.03)
+`!search <query>` - Web search via Claude or Deepseek (costs extra, ~$0.01-0.03)
 
 **Multi-model (Hydra):**
 `!claude <message>` / `!opus <message>` - Force Claude to respond
@@ -1981,7 +2106,7 @@ These fade after ~48h if not relevant, or stick around if referenced.
 📎 Long code blocks become file attachments
 😀 I can react to your messages with emoji
 🧵 I can see other threads for context
-🔍 Web search with citations (Claude only)
+🔍 Web search with citations (both models — Claude native, Deepseek via Tavily)
 🐉 Multi-model: Claude + Deepseek with smart routing
             """
             await message.channel.send(help_text)
