@@ -85,13 +85,24 @@ Some context about this server:
 - Be concise in casual chat, detailed when asked technical questions
 - You can use markdown formatting, but Discord has a 2000 char limit per message
 
-## Multi-model system
+## Your identity
 
-You are one of potentially multiple AI models responding in this server (the "Hydra" system).
-Your responses will be labeled with your model name (e.g., [Claude] or [Deepseek]).
-When you see labeled responses from other models in the conversation history,
-treat them as prior assistant messages - you share the same memory system.
-Don't be competitive - you're collaborators with different strengths.
+You are **{model_name}** (model ID: `{model_id}`). This is not a guess — this is what you are.
+Do NOT claim to be a different model. Do NOT say you "can't tell from the inside."
+If someone asks what model you are, state it confidently.
+
+{identity_details}
+
+## Multi-model system (Hydra)
+
+You are one of multiple AI models responding in this server. The "Hydra" system routes
+messages to the best-suited model automatically, or users can invoke you directly.
+Your responses are labeled with your model name (e.g., **[Claude]** or **[Deepseek]**).
+The other model is your collaborator, not your competitor — you share a memory system.
+When you see labeled responses from the other model in conversation history,
+those are real responses from that model, not from you. Respect the boundary.
+
+{routing_context}
 
 ## Special capabilities
 
@@ -1043,6 +1054,7 @@ class ClaudeBot(commands.Bot):
         
         # Check for direct model invocation (!claude / !opus / !deepseek)
         forced_provider = None
+        routing_reason = ""
         content_lower = (message.content or "").lower()
         for prefix in ("!claude", "!opus"):
             if content_lower.startswith(prefix + " ") or content_lower == prefix:
@@ -1050,6 +1062,7 @@ class ClaudeBot(commands.Bot):
                     await message.channel.send("❌ Claude is not configured (no API key).")
                     return
                 forced_provider = self.claude_provider
+                routing_reason = f"User directly invoked Claude with {prefix} command."
                 message.content = message.content[len(prefix):].strip()
                 break
         if forced_provider is None:
@@ -1058,6 +1071,7 @@ class ClaudeBot(commands.Bot):
                     await message.channel.send("❌ Deepseek is not configured (no API key).")
                     return
                 forced_provider = self.deepseek_provider
+                routing_reason = "User directly invoked Deepseek with !deepseek command."
                 message.content = message.content[len("!deepseek"):].strip()
 
         # Handle commands (but not if we just consumed a model prefix)
@@ -1073,7 +1087,10 @@ class ClaudeBot(commands.Bot):
         thread, is_new_thread = await self._ensure_thread(message)
 
         # Select which model responds (forced or auto)
-        provider = forced_provider or await self._select_model(message, message.guild.id)
+        if forced_provider:
+            provider = forced_provider
+        else:
+            provider, routing_reason = await self._select_model(message, message.guild.id)
 
         # Generate response
         async with thread.typing():
@@ -1082,6 +1099,7 @@ class ClaudeBot(commands.Bot):
                 message.guild.id,
                 initial_message=message if is_new_thread else None,
                 provider=provider,
+                routing_reason=routing_reason,
             )
 
         # Label the response with model name (only when multi-model is active)
@@ -1200,15 +1218,41 @@ class ClaudeBot(commands.Bot):
                 converted.append(msg)
         return converted
 
-    def _build_system_prompt(self, provider: ModelProvider) -> str:
-        """Build system prompt tailored to the provider."""
+    def _build_system_prompt(self, provider: ModelProvider, routing_reason: str = "") -> str:
+        """Build system prompt tailored to the provider, with identity and routing context."""
+        # Model identity line
         if provider.name == "Claude":
             identity = f"Claude (model: {provider.model_id}), an AI assistant made by Anthropic"
+            identity_details = (
+                "You are Claude, NOT Deepseek. If the conversation contains **[Deepseek]** labeled messages, "
+                "those are from the OTHER model — not from you. You have vision (can see images) and "
+                "built-in web search. Your strengths: complex analysis, code review, creative writing, nuance."
+            )
         elif provider.name == "Deepseek":
             identity = f"Deepseek (model: {provider.model_id}), an AI assistant made by DeepSeek"
+            identity_details = (
+                "You are Deepseek, NOT Claude. If the conversation contains **[Claude]** labeled messages, "
+                "those are from the OTHER model — not from you. You cannot see images. "
+                "You can search the web via Tavily function calling. "
+                "Your strengths: fast responses, factual questions, casual chat, cost-efficient."
+            )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
-        return CONFIG.system_prompt.replace("{model_identity}", identity)
+            identity_details = ""
+
+        # Routing context
+        if routing_reason:
+            routing_context = f"**Why you were chosen for this message:** {routing_reason}"
+        else:
+            routing_context = ""
+
+        prompt = CONFIG.system_prompt
+        prompt = prompt.replace("{model_identity}", identity)
+        prompt = prompt.replace("{model_name}", provider.name)
+        prompt = prompt.replace("{model_id}", provider.model_id)
+        prompt = prompt.replace("{identity_details}", identity_details)
+        prompt = prompt.replace("{routing_context}", routing_context)
+        return prompt
 
     # Deepseek function-calling tool definition
     DEEPSEEK_TOOLS = [{
@@ -1296,36 +1340,37 @@ class ClaudeBot(commands.Bot):
 
         return max(0.0, min(1.0, score))
 
-    async def _select_model(self, message: discord.Message, guild_id: int) -> ModelProvider:
-        """Select which model should respond to this message."""
+    async def _select_model(self, message: discord.Message, guild_id: int) -> tuple[ModelProvider, str]:
+        """Select which model should respond to this message.
+        Returns (provider, routing_reason) tuple."""
         # Hard rule: only Claude can handle images
         has_images = any(
             any(a.filename.lower().endswith(ext) for ext in CONFIG.image_types)
             for a in message.attachments
         )
         if has_images and self.claude_provider.enabled:
-            return self.claude_provider
+            return self.claude_provider, "Image detected — only Claude has vision capability."
 
         # Only one model available?
         if not self.deepseek_provider.enabled:
-            return self.claude_provider
+            return self.claude_provider, "Only Claude is configured (no Deepseek API key)."
         if not self.claude_provider.enabled:
-            return self.deepseek_provider
+            return self.deepseek_provider, "Only Deepseek is configured (no Claude API key)."
 
         # User preference for this channel?
         channel_id = message.channel.id
         parent_id = getattr(message.channel, 'parent_id', None)
         pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
         if pref == "claude":
-            return self.claude_provider
+            return self.claude_provider, "User set channel preference to Claude (!prefer claude)."
         elif pref == "deepseek":
-            return self.deepseek_provider
+            return self.deepseek_provider, "User set channel preference to Deepseek (!prefer deepseek)."
 
         # Global default override?
         if CONFIG.default_model == "claude":
-            return self.claude_provider
+            return self.claude_provider, "Global default model is set to Claude."
         elif CONFIG.default_model == "deepseek":
-            return self.deepseek_provider
+            return self.deepseek_provider, "Global default model is set to Deepseek."
 
         # Auto-select via confidence heuristic
         text = message.content or ""
@@ -1334,9 +1379,19 @@ class ClaudeBot(commands.Bot):
 
         # Prefer cheaper model when close
         if claude_score > deepseek_score + 0.05:
-            return self.claude_provider
+            reason = (
+                f"Auto-routed by heuristic: Claude scored {claude_score:.2f} vs "
+                f"Deepseek {deepseek_score:.2f}. Claude won by >{(claude_score - deepseek_score):.2f} "
+                f"(needs >0.05 margin over Deepseek's cost advantage)."
+            )
+            return self.claude_provider, reason
         else:
-            return self.deepseek_provider
+            reason = (
+                f"Auto-routed by heuristic: Deepseek scored {deepseek_score:.2f} vs "
+                f"Claude {claude_score:.2f}. Deepseek wins ties and close calls "
+                f"(margin was {(claude_score - deepseek_score):.2f}, needs >0.05 for Claude)."
+            )
+            return self.deepseek_provider, reason
 
     async def _generate_deepseek_response(
         self,
@@ -1446,6 +1501,7 @@ class ClaudeBot(commands.Bot):
         guild_id: int,
         initial_message: discord.Message = None,
         provider: ModelProvider = None,
+        routing_reason: str = "",
     ) -> tuple[str, list[str]]:
         """
         Generate response from the selected model provider.
@@ -1515,7 +1571,7 @@ class ClaudeBot(commands.Bot):
             return "I don't see any messages to respond to!", []
 
         # Build system prompt with all context sources
-        system_parts = [self._build_system_prompt(provider)]
+        system_parts = [self._build_system_prompt(provider, routing_reason)]
 
         # 1. Thread index (READ-ONLY - prevents feedback loops)
         thread_index = await self.manager.fetch_thread_index(channel)
