@@ -1244,7 +1244,8 @@ class ClaudeBot(commands.Bot):
             identity_details = (
                 "**[Deepseek]** messages in the conversation are from your collaborator Deepseek — "
                 "a different model, not you. Your capabilities include vision (you can see images) "
-                "and built-in web search. You tend to shine at complex analysis, code review, "
+                "and built-in web search — you can search the web anytime you think it would help, "
+                "not just when users use !search. You tend to shine at complex analysis, code review, "
                 "creative writing, and nuance."
             )
         elif provider.name == "Deepseek":
@@ -1265,7 +1266,11 @@ class ClaudeBot(commands.Bot):
                 "showing original text, breaking down words, or when a concept has no clean English "
                 "equivalent — but your response itself should always be in English. Never reply with "
                 "a wall of Chinese text. Your job is to be a bridge between languages, not to exclude "
-                "English speakers from the conversation."
+                "English speakers from the conversation.\n\n"
+                "**Formatting**: Write in flowing prose, not listicles. Avoid walls of bullet points, "
+                "numbered lists, tables, and headers unless the user specifically asks for structured "
+                "output. Keep it conversational — this is Discord chat, not a report. "
+                "Minimize blank lines between paragraphs."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
@@ -1534,7 +1539,10 @@ class ClaudeBot(commands.Bot):
             for match in re.finditer(reaction_pattern, response_text):
                 reactions.append(match.group(1).strip())
             response_text = re.sub(reaction_pattern, '', response_text).strip()
-            response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)
+            # Clean up Deepseek's verbose formatting
+            response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)  # Triple+ newlines → double
+            response_text = re.sub(r'\n\n+(#+\s)', r'\n\1', response_text)  # Extra newlines before headers
+            response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)  # Extra newlines before bold labels
             response_text = re.sub(r'  +', ' ', response_text)
 
             return response_text, reactions
@@ -1645,14 +1653,21 @@ class ClaudeBot(commands.Bot):
         if provider.name == "Deepseek":
             return await self._generate_deepseek_response(guild_id, messages, system)
 
-        # Claude path (default)
+        # Claude path (default) — with organic web search capability
         try:
+            # Give Claude the web search tool so it can search organically
+            claude_tools = [{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }]
+
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
                 model=self.claude_provider.model_id,
                 max_tokens=self.claude_provider.max_tokens,
                 system=system,
-                messages=messages
+                messages=messages,
+                tools=claude_tools
             )
 
             # Track usage
@@ -1660,10 +1675,48 @@ class ClaudeBot(commands.Bot):
             self.claude_provider.total_output_tokens += response.usage.output_tokens
             self.claude_provider.total_requests += 1
 
+            # Handle tool use loop — Claude may decide to search the web
+            search_rounds = 0
+            while response.stop_reason == "tool_use" and search_rounds < 3:
+                tool_use_block = None
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_use_block = block
+                        break
+                if not tool_use_block:
+                    break
+
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_block.id,
+                        "content": "Search completed."
+                    }]
+                })
+
+                response = await asyncio.to_thread(
+                    self.claude_client.messages.create,
+                    model=self.claude_provider.model_id,
+                    max_tokens=self.claude_provider.max_tokens,
+                    system=system,
+                    messages=messages,
+                    tools=claude_tools
+                )
+
+                self.claude_provider.total_input_tokens += response.usage.input_tokens
+                self.claude_provider.total_output_tokens += response.usage.output_tokens
+                search_rounds += 1
+
             if not response.content:
                 return "I received an empty response from the API.", []
 
-            response_text = response.content[0].text if hasattr(response.content[0], 'text') else str(response.content[0])
+            # Extract text from all content blocks (may include search result blocks)
+            response_text = ""
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    response_text += block.text
 
             # Extract and process working memory notes
             note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
