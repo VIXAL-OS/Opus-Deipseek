@@ -40,8 +40,9 @@ self-contained — you don't need it to pick up the remaining work below.
   `CachedContent` when `backend="vertex"`); everything else → the OpenAI-compatible shim
   (`_generate_openai_compatible_response`) via `self.clients[provider.id]`. Per-provider wiring lives
   in the registry, not `__init__`.
-- **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-06):
-  `qwen3p7-plus`, `glm-5p2`, `deepseek-v4-pro` (under `accounts/fireworks/models/`). Mistral on
+- **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-09-21):
+  `glm-5p3`, `qwen3p8-max`, `deepseek-v4p1-flash` (under `accounts/fireworks/models/`); Qwen's
+  default is now `qwen3.8-flash` on Alibaba US and DeepSeek's is `deepseek-flash` (see CLAUDE.md). Mistral on
   its own API uses `mistral-large-latest` (→ Mistral Large 3, released 2025-12, 675B/41B MoE,
   Apache-2.0; priced $0.50/$1.50 per Mtok as of 2026-06 — a ~4× drop from Large 2). ⚠️ Large 3 is
   on Fireworks only as **on-demand/dedicated** (`mistral-large-3-fp8`), NOT serverless — so the

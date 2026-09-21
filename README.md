@@ -1,13 +1,13 @@
 # Hydra Discord Bot (Opus-Deipseek)
 
-A multi-model Discord bot powered by **Claude Opus 5**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Four open-weight heads join too: **Qwen 3.7** and **GLM 5.2** via a single Fireworks AI endpoint (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set, and **Kimi K3** (Moonshot's 2.8T-param flagship, 1M context) via `api.moonshot.ai` when `MOONSHOT_API_KEY` is set.
+A multi-model Discord bot powered by **Claude Opus 5**, **DeepSeek V4.1 Flash**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Four open-weight heads join too: **GLM 5.3** via Fireworks AI (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, **Qwen 3.8 Flash** via Alibaba Model Studio's US (Virginia) region when `DASHSCOPE_API_KEY` is set, **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set, and **Kimi K3** (Moonshot's 2.8T-param flagship, 1M context) via `api.moonshot.ai` when `MOONSHOT_API_KEY` is set.
 
 Affectionately maps to the EVA *MAGI* trinity, with the open-weight heads as the pilots you deploy:
 - **Claude / Balthasar** — careful, thorough, vision, native Anthropic web search, multi-tool orchestration
 - **DeepSeek / Melchior** — fast, cheap, CJK-strong, Tavily-backed search, automatic server-side prompt caching
 - **Gemini / Caspar** — abstract reasoning, long-context synthesis, vision, native Google Search grounding
 - **Mistral / Mari** — French & European-language specialist (the `!french` tutor), on its own EU API (low-carbon French grid)
-- **Qwen / Rei** — cheap, strong coding & math on Fireworks (US/ZDR); auto-routed for routine code/math
+- **Qwen / Rei** — cheap, strong coding & math (Qwen 3.8 Flash on Alibaba US; Fireworks 3.8 Max as a backend toggle); auto-routed for routine code/math
 - **GLM / Asuka** — agentic/tool-use open head on Fireworks (US/ZDR); override-only via `!glm` / `!asuka`
 - **Kimi / Kaworu** — Kimi K3, the largest open-weights model (2.8T MoE, 1M ctx); premium-priced, override-only via `!kimi` / `!k3` / `!kaworu`
 
@@ -28,7 +28,7 @@ just *adds* its flavor aliases.
 
 ## Features
 
-- 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Qwen + GLM (Fireworks), Mistral (its own EU API), and Kimi K3 (Moonshot API), with automatic routing
+- 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Qwen (Alibaba US), GLM (Fireworks), Mistral (its own EU API), and Kimi K3 (Moonshot API), with automatic routing
 - 📚 **Bookclub mode** — pin long texts to a channel; discuss across all three models with per-thread chapter scoping
 - 🧵 **Thread-based conversations** — keeps channels clean
 - 🫧 **Speaker-aware participation** — chatty one-on-one sessions automatically become quiet ambient mode when a second human/PluralKit speaker joins; Haiku only approves exceptional unsolicited interventions
@@ -47,7 +47,7 @@ just *adds* its flavor aliases.
 
 ## The Hydra System
 
-The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural system (the three Fireworks heads join the rotation when configured):
+The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural system (the open-weight heads join the rotation when configured):
 
 ```
        User message arrives
@@ -66,7 +66,7 @@ The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural s
 - CJK text → DeepSeek (deeper Chinese training data)
 - Novel reasoning / abstract patterns / long-context synthesis → Gemini (ARC-AGI-2 strength)
 - Complex code / multi-tool orchestration / careful epistemics → Claude
-- Routine code / math → Qwen (frontier coding/math at Fireworks prices; complex/careful work still goes to Claude)
+- Routine code / math → Qwen (strong coding/math at Flash prices; complex/careful work still goes to Claude)
 - French-language intent → Mistral
 - Short factual / casual chat → DeepSeek (50-100× cheaper)
 - Ties → cheaper model wins
@@ -97,7 +97,7 @@ The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural s
 | `!deepseek <msg>` / `!melchior <msg>` | Force DeepSeek to respond |
 | `!gemini <msg>` / `!caspar <msg>` | Force Gemini to respond |
 | `!mistral <msg>` / `!mari <msg>` | Force Mistral — French/EU specialist (needs `MISTRAL_API_KEY`) |
-| `!qwen <msg>` / `!rei <msg>` | Force Qwen — cheap coder/mathematician (needs `FIREWORKS_API_KEY`) |
+| `!qwen <msg>` / `!rei <msg>` | Force Qwen — cheap coder/mathematician (needs `DASHSCOPE_API_KEY`) |
 | `!glm <msg>` / `!asuka <msg>` | Force GLM — agentic open head (needs `FIREWORKS_API_KEY`) |
 | `!kimi <msg>` / `!k3 <msg>` / `!kaworu <msg>` | Force Kimi K3 — frontier open head, 1M ctx, premium $ (needs `MOONSHOT_API_KEY`) |
 | `!think <msg>` | Use extended thinking (deeper reasoning, slower & costlier) |
@@ -233,7 +233,7 @@ AO3 sheds anonymous traffic under load with HTTP 403 "Shields are up!" — affec
 - **DeepSeek** ([platform.deepseek.com](https://platform.deepseek.com/)) — required or optional
 - **Gemini** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)) — required or optional; AI Studio key, not Vertex
 - **Tavily** ([tavily.com](https://tavily.com/)) — optional, enables DeepSeek web search (free 1,000 searches/month)
-- **Fireworks** ([fireworks.ai](https://fireworks.ai/)) — optional, one key serves Qwen + GLM on US zero-retention infra (prepaid as of July 2026 — set auto-reload so calls don't fail at $0)
+- **Fireworks** ([fireworks.ai](https://fireworks.ai/)) — optional, serves GLM (plus Qwen on its `fireworks` backend) on US zero-retention infra (prepaid as of July 2026 — set auto-reload so calls don't fail at $0)
 - **Mistral** ([console.mistral.ai](https://console.mistral.ai/)) — optional, enables Mistral (Mari) via `api.mistral.ai` (EU-resident; Mistral Large isn't on Fireworks serverless)
 - **Moonshot / Kimi** ([platform.kimi.ai](https://platform.kimi.ai/)) — optional, enables Kimi K3 (Kaworu) via `api.moonshot.ai` (China-resident, like DeepSeek's own API; K3 isn't on US serverless hosts yet — weights drop 2026-07-27)
 - **Azure Speech** ([portal.azure.com](https://portal.azure.com/)) — optional, powers `!speak` (Mandarin) and `!french` (French) TTS (free tier ~0.5M chars/month)
@@ -257,11 +257,13 @@ ANTHROPIC_API_KEY=your_anthropic_key      # Optional if Gemini or DeepSeek only
 DEEPSEEK_API_KEY=your_deepseek_key        # Optional
 GEMINI_API_KEY=your_gemini_key            # Optional
 TAVILY_API_KEY=your_tavily_key            # Optional
-FIREWORKS_API_KEY=your_fireworks_key      # Optional, enables Qwen + GLM (US/ZDR)
+FIREWORKS_API_KEY=your_fireworks_key      # Optional, enables GLM (US/ZDR)
+DASHSCOPE_API_KEY=your_dashscope_key      # Optional, enables Qwen 3.8 Flash (Rei) — Alibaba US (Virginia); key is region-locked
 MISTRAL_API_KEY=your_mistral_key          # Optional, enables Mistral (Mari) — api.mistral.ai (EU)
 MOONSHOT_API_KEY=your_moonshot_key        # Optional, enables Kimi K3 (Kaworu) — api.moonshot.ai (CN)
 AZURE_TTS_KEY=your_azure_speech_key       # Optional, !speak (Mandarin) + !french (French) TTS
 AZURE_TTS_REGION=eastus                    # Optional, Azure Speech resource region
+AZURE_TTS_ENABLED=true                     # Optional off-switch — false parks TTS without deleting the keys
 AO3_COOKIE=                               # Optional, for bookclub mode
 ```
 
@@ -316,7 +318,7 @@ You can also edit this **live from Discord** (guild owner / admin): `!server_con
 python bot.py
 ```
 
-The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini, Mistral, Qwen, GLM, Kimi} depending on which API keys are present. `FIREWORKS_API_KEY` gates Qwen + GLM; `MISTRAL_API_KEY` gates Mistral (its own EU API); `MOONSHOT_API_KEY` gates Kimi. Each missing key disables exactly its provider(s) and leaves the rest untouched.
+The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini, Mistral, Qwen, GLM, Kimi} depending on which API keys are present. `FIREWORKS_API_KEY` gates GLM; `DASHSCOPE_API_KEY` gates Qwen (or `FIREWORKS_API_KEY` on its `fireworks` backend); `MISTRAL_API_KEY` gates Mistral (its own EU API); `MOONSHOT_API_KEY` gates Kimi. Each missing key disables exactly its provider(s) and leaves the rest untouched.
 
 ## Cost Comparison
 
@@ -324,13 +326,13 @@ The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemin
 |-------|-------|--------------|--------|--------------|------------------------|
 | Claude Opus 5 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
 | Gemini 3.1 Pro | $2-4/M (tiered ≤/>200k) | $0.50-1.00/M (25%) | $12-18/M | ~$0.01-0.02 | ~$0.40/turn after cache |
-| DeepSeek V4 Pro | $0.435/M | $0.003625/M (~99%) | $0.87/M | ~$0.0005-0.002 | ~$0.005/turn after cache |
+| DeepSeek V4.1 Flash (2× at peak hours) | $0.15/M | $0.003/M (~98%) | $0.60/M | ~$0.0005-0.002 | ~$0.002/turn after cache |
 | Mistral Large 3 (own API) | $0.50/M | — | $1.50/M | ~$0.001-0.004 | — |
-| Qwen 3.7 Plus (Fireworks) | $0.40/M | $0.08/M (20%) | $1.60/M | ~$0.001-0.003 | — |
-| GLM 5.2 (Fireworks) | $1.40/M | $0.14/M (10%) | $4.40/M | ~$0.003-0.008 | — |
+| Qwen 3.8 Flash (Alibaba US) | $0.113/M | ~$0.011/M (~10%) | $0.382/M | ~$0.0005-0.002 | ~$0.004/turn after cache |
+| GLM 5.3 (Fireworks) | $1.40/M | $0.26/M (~19%) | $4.40/M | ~$0.003-0.008 | ~$0.09/turn after cache |
 | Kimi K3 (Moonshot API) | $3.00/M | $0.30/M (auto, 90%) | $15.00/M | ~$0.02-0.06 | ~$0.11/turn after cache |
 
-These open-head rows are estimates — verify on the [Fireworks pricing page](https://fireworks.ai/pricing) (Qwen/GLM), [console.mistral.ai](https://console.mistral.ai/) (Mistral), and [platform.kimi.ai](https://platform.kimi.ai/) (Kimi — 2026-07 launch pricing). Fireworks serverless can run ~2-4× a model-maker's own API (the US-residency + ZDR premium) and discounts cached input by 50%. Note Kimi K3 is the *premium* open head — above Claude on input — which is why it's override-only.
+These open-head rows are estimates — verify on the [Fireworks pricing page](https://fireworks.ai/pricing) (GLM), [Model Studio pricing](https://www.alibabacloud.com/help/en/model-studio/model-pricing) (Qwen), [console.mistral.ai](https://console.mistral.ai/) (Mistral), and [platform.kimi.ai](https://platform.kimi.ai/) (Kimi — 2026-07 launch pricing). Fireworks serverless can run ~2-4× a model-maker's own API (the US-residency + ZDR premium) and discounts cached input per model (~80-90% off for these heads). DeepSeek's own API bills 2× on every item during peak hours (01:00-04:00 + 06:00-10:00 UTC, Mon-Fri); `!cost` meters that as a separate surcharge. Note Kimi K3 is the *premium* open head — above Claude on input — which is why it's override-only.
 
 DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Qwen catches routine code/math cheaply; Mistral is the French/EU specialist. Use `!cost` to see a real-time breakdown including cache hit rates and a rough per-provider energy/CO₂ estimate (grid carbon intensity follows the *endpoint*, not the brand — Mistral on its own EU API runs on France's ~nuclear grid (~20 g/kWh), while the Fireworks heads are US (~400)).
 
@@ -356,7 +358,7 @@ bot.py (single file, ~5900 lines)
     ├── _select_model()                  - heuristic routing (no LLM call)
     ├── _estimate_confidence()           - per-model scoring with CJK detection
     ├── _generate_response()             - dispatches to Claude/DeepSeek/Gemini +
-    │                                      Mistral (own API), Qwen/GLM (Fireworks), Kimi (Moonshot)
+    │                                      Mistral (own API), Qwen (Alibaba US), GLM (Fireworks), Kimi (Moonshot)
     ├── _generate_openai_compatible_response()
     │                                    - DeepSeek + Gemini (non-bookclub) shim path
     ├── _generate_gemini_native_response()

@@ -2,7 +2,7 @@
 
 Single-file (`bot.py`) multi-model Discord bot. EVA/MAGI-themed heuristic router over
 **Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
-**Qwen (Rei) · GLM (Asuka)** on Fireworks, **Mistral (Mari)** on its own EU API, and
+**Qwen (Rei)** on Alibaba Model Studio (US-Virginia) · **GLM (Asuka)** on Fireworks, **Mistral (Mari)** on its own EU API, and
 **Kimi K3 (Kaworu)** — Moonshot API by code default, but the live config.json overrides it onto
 Fireworks serverless (`providers.kimi.backend="fireworks"`, rides `FIREWORKS_API_KEY`; override-only
 in routing). Two-tier memory,
@@ -23,8 +23,9 @@ self-contained — you don't need it to pick up the remaining work below.
 
 ## Editing rules (load-bearing — read before touching bot.py)
 - **Graceful degradation:** a missing API key disables ONLY that provider. The gating key follows
-  the *active backend* (`provider.api_key_env`): by default `FIREWORKS_API_KEY` gates Qwen+GLM
-  together and **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its flagship (Large 3)
+  the *active backend* (`provider.api_key_env`): by default `FIREWORKS_API_KEY` gates GLM, **Qwen has
+  its own `DASHSCOPE_API_KEY`** (Alibaba US-Virginia — region-locked key; Qwen's `fireworks` backend
+  moves it back onto the Fireworks key), and **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its flagship (Large 3)
   is on-demand-only on Fireworks, not serverless. `self_hosted`/`vertex` backends have no key and aren't
   key-gated (operator owns the local server / GCP ADC). Absent keys disable exactly those providers.
 - **Config-driven registry (Phase 0).** `ProviderRegistry.from_config()` (built once in `__init__`
@@ -43,9 +44,11 @@ self-contained — you don't need it to pick up the remaining work below.
   `CachedContent` when `backend="vertex"`); everything else → the OpenAI-compatible shim
   (`_generate_openai_compatible_response`) via `self.clients[provider.id]`. Per-provider wiring lives
   in the registry, not `__init__`.
-- **Model slugs drift** — verify in the live libraries. All heads re-verified 2026-08-02: Claude
-  `claude-opus-5`, DeepSeek `deepseek-v4-pro`, Gemini `gemini-3.1-pro-preview` (still no stable
-  3.1-pro), Fireworks `qwen3p7-plus` + `glm-5p2` (under `accounts/fireworks/models/`), Moonshot
+- **Model slugs drift** — verify in the live libraries (Fireworks retires serverless models on
+  ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
+  Alibaba `qwen3.8-flash` (docs only — no key yet), Fireworks `glm-5p3` + the `qwen3p8-max` /
+  `deepseek-v4p1-flash` backend toggles (under `accounts/fireworks/models/`). 2026-08-02: Claude
+  `claude-opus-5`, Gemini `gemini-3.1-pro-preview` (still no stable 3.1-pro), Moonshot
   `kimi-k3`. Mistral on its own API uses `mistral-large-latest` (→ Mistral Large 3, released
   2025-12, 675B/41B MoE, Apache-2.0; $0.50/$1.50 per Mtok reconfirmed 2026-08 — note Mistral's
   *frontier* is now Medium 3.5 / `mistral-medium-latest` at $1.50/$7.50, which the Large alias
@@ -76,7 +79,72 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-08-02
+## Status — 2026-09-21
+
+### ✅ Provider-email sweep: dead Fireworks slugs, DeepSeek → V4.1 Flash + peak pricing, Qwen → Alibaba (2026-09-21)
+Triggered by unread provider emails (Fireworks serverless deprecations 08-27 / 09-04 / 09-25,
+DeepSeek V4.1 Flash + peak pricing, Azure subscription deletion). Every Fireworks/DeepSeek slug below
+was verified with live calls (plain turn + web_search tool round-trip).
+- **Qwen (Rei) was DOWN from 2026-09-04** — `qwen3p7-plus` 404s on Fireworks serverless. Fireworks'
+  replacement `qwen3p8-max` is its only serverless Qwen and ~5× the price ($2/$6, cached $0.25).
+  **Sarah's call:** the Discord bot's Qwen DEFAULT is now **Qwen 3.8 Flash on Alibaba Model Studio,
+  US (Virginia)** — `backend="alibaba"`, `qwen3.8-flash`, `dashscope-us.aliyuncs.com/compatible-mode/v1`,
+  `DASHSCOPE_API_KEY` (⚠️ region-locked: the key must be created in US-Virginia), $0.113/$0.382 flat to
+  1M ctx — so Rei stays the cheap auto-routed coder (routing unchanged). Fireworks 3.8 Max stays as
+  `backends["fireworks"]`. **isaic-slack-bot deliberately differs:** Fireworks 3.8 Max is its default,
+  still auto-routed (Sarah's call). Only Alibaba serves 3.8 Flash (its open "Flash Next" weights are
+  dedicated-GPU-only on Fireworks). `_BACKEND_FIELD_MAP` gained `max_context_tokens` +
+  `est_wh_per_1k_tokens` so a backend carries its own model's context/energy. ⚠️ **Owes a live smoke
+  test** — no DashScope key yet, so Rei is DISABLED on Discord until `DASHSCOPE_API_KEY` is set (set
+  `providers.qwen.backend="fireworks"` to run 3.8 Max meanwhile). Thinks by default like the Fireworks
+  Qwen (`enable_thinking` in extra_body toggles it; reasoning echo optional).
+- **GLM (Asuka)** `glm-5p2` retires 2026-09-25 → `glm-5p3` (same $1.40/$4.40; cached $0.14→$0.26;
+  context 200k→1,048,576, so GLM can now take a bookclub text in full).
+- **DeepSeek (Melchior) → V4.1 Flash** (`deepseek-flash`, Sarah's call). DeepSeek's own numbers: Flash
+  wins every coding/agent bench (DeepSWE 74.2 vs 62.7, Terminal-Bench 3.0 30.0 vs 11.8, Codeforces 3471
+  vs 3348); Pro keeps GPQA (92.4 vs 90.9) + HLE (42.7 vs 39.1). $0.15/$0.60/$0.003 off-peak. (The old
+  $0.435/$0.87 constants were an expired promo — V4 Pro itself is now $0.66/$1.98.) Pro was slated to be
+  force-routed to Flash on 09-14, then reprieved "until further notice"; V4.1 Pro is unreleased —
+  re-evaluate when it lands. Verified live on `deepseek-flash`: thinking-disabled extra_body,
+  thinking-on + reasoning_content echo, tool round-trip, `prompt_cache_hit_tokens`. `est_wh` 0.3→0.2
+  (~8B in / ~16B out active). **discord-companion-bot migrated too** (`rules/llm_adapter.py`): the MTG
+  strategist moved `deepseek-v4-pro` → `deepseek-flash` (keeps `reasoning_effort="medium"`, thinking on)
+  and the actor's legacy `deepseek-v4-flash` alias → canonical `deepseek-flash` (thinking off, JSON) —
+  both configs verified live. Its `!cost` got a new **exact-priced V4.1 Flash bucket**
+  (`_deepseek_v41_cost`: $0.15 miss / $0.003 cache-hit / $0.60 out, 2× in peak hours, priced per call
+  at record time; the adapter's `_Usage` now carries `prompt_cache_hit_tokens` as a subset of input).
+  Every non-Pro DeepSeek name lands there; the old actor + pro buckets are frozen history at their old
+  flat rates so lifetime totals aren't re-priced. The MTG cog that calls these factories lives outside
+  that repo — re-check strategist memo length/compliance vs the May 23 V4-Pro baseline.
+- **Peak-hour pricing implemented.** `ModelProvider.peak_windows_utc` + `peak_multiplier`;
+  `record_usage` meters a peak request's extra cost into `total_peak_surcharge` (persisted as
+  `peak_surcharge`; token buckets + energy untouched); `get_cost` = `_token_cost()` + surcharge; `!cost`
+  shows "(incl. $X peak-hour surcharge)". DeepSeek: 2× during 01–04 + 06–10 UTC Mon–Fri (US Eastern:
+  Sun–Thu 9pm–midnight + weekday 2–6am); Chinese public holidays are ignored (over-reports — safe
+  side). Backends opt out with `peak_windows_utc: ()` (Fireworks is flat; self_hosted is local).
+- **DeepSeek `fireworks` backend** slug was dead since 08-27 → `deepseek-v4p1-flash` ($0.30/$1.20/$0.006
+  per Fireworks docs; its /models listing shows $0.22/$0.66 — VERIFY). Thinking-disable verified live.
+- **Azure TTS is PARKED** (the free-credit subscription was deleted 2026-08-21, so `AZURE_TTS_KEY` is
+  dead). New env off-switch **`AZURE_TTS_ENABLED=false`** (set in the live `.env`; unset/true = normal)
+  blanks the key at startup, so every TTS path acts unconfigured: no Azure calls, inline
+  `[[speak:]]`/`[[french:]]` markers collapse to plain text BEFORE any G2P LLM call, and `!speak` /
+  `!french` reply "🔇 switched off". Mirrored to isaic. Offline: `scratchpad/test_tts_switch.py` (15/15 —
+  flag parsing both ways on a real `ClaudeBot()` built in a temp dir, zero Azure/G2P calls when off).
+  **To turn it back on:** pay-as-you-go subscription + an F0 Speech resource (0.5M chars/month free;
+  S1 neural is $15/1M chars) → new `AZURE_TTS_KEY`/`AZURE_TTS_REGION` in `.env`, flip
+  `AZURE_TTS_ENABLED=true`, restart.
+- Mirrored to isaic-slack-bot (core.py constants + peak pricing, config.example.json → `deepseek-flash`,
+  README). Offline: new `scratchpad/test_peak_pricing.py` (33/33 here incl. Qwen registry key-gating;
+  29/29 in isaic) and every existing harness still green in both repos.
+- ✅ **Cache-hit accounting gap — fixed (same day).** The shim used to read only DeepSeek's
+  `prompt_cache_hit_tokens`, so Fireworks/Alibaba hits (reported in the OpenAI-standard
+  `prompt_tokens_details.cached_tokens`) billed at full input in `!cost`. Module-level
+  `_usage_cache_hits(usage)` now reads both (SDK object or dict; None-safe) — DeepSeek's field wins when
+  non-zero so a response carrying both is never double-counted — at all 4 call sites (first call, tool
+  loop, degraded retry, simulator). Qwen/GLM/Kimi cache rates are now live; plain `!gemini` shim turns
+  also get the discount IF Google fills the standard field (unverified). Mirrored to isaic. Offline:
+  `scratchpad/test_cache_hits.py` (22/22 in both repos — helper shapes, call-site migration, shim +
+  simulator end-to-end over a fake client).
 
 ### ✅ Model refresh: Claude → Opus 5; every other head re-verified latest (2026-08-02)
 `claude-opus-4-8` → **`claude-opus-5`** (same $5/$25 + cache rates — drop-in, `!cost` math
@@ -386,8 +454,8 @@ deviation). The per-backend reference below still applies (values flagged `VERIF
 
 **DeepSeek** stays on its China `api` for the Discord bot (Sarah's call — cheap, and "the Chinese can
 have the shitposts"). To add the toggle: `providers.deepseek.backend = api | fireworks | self_hosted`.
-- `fireworks` → `accounts/fireworks/models/deepseek-v4-pro`, shares `FIREWORKS_API_KEY`, keep
-  per-token cost at Fireworks rates (~1.74/3.48), server cache at 50%. Update its
+- `fireworks` → `accounts/fireworks/models/deepseek-v4p1-flash` (V4 Pro left Fireworks serverless
+  2026-08; see the 2026-09-21 entry), shares `FIREWORKS_API_KEY`, flat Fireworks rates. Update its
   `grid_gco2_per_kwh` to ~400 (US) when on this backend.
 - `self_hosted` → local vLLM/Ollama base_url; set `supports_server_cache=False`; add a `local`
   cost mode in `_record_*_usage()` (skip per-token $, label the turn `local`); V4-Flash or 4-bit
@@ -481,9 +549,8 @@ intentionally out of scope.
 - ~~Verify **pricing**~~ — done 2026-08-02: Fireworks `qwen3p7-plus` ($0.40/$1.60, cached $0.08) /
   `glm-5p2` ($1.40/$4.40, cached $0.14) / `kimi-k3` ($3/$15, cached $0.30) and Mistral
   `mistral-large-latest` ($0.50/$1.50) all confirmed against official pages; constants updated.
-  ⚠️ New watch item: DeepSeek has ANNOUNCED (not yet live, start date TBA) peak-hour 2× pricing on
-  all billing items during Beijing 9:00–12:00 / 14:00–18:00 — would break the flat cost constants
-  when it lands. The **energy** constants (`est_wh_per_1k_tokens`, `train_tco2e`) are
+  DeepSeek's peak-hour 2× pricing went live 2026-09-10 and is now metered (see the 2026-09-21
+  entry). The **energy** constants (`est_wh_per_1k_tokens`, `train_tco2e`) are
   order-of-magnitude (Mistral `train_tco2e` is still the Large-2 LCA — Large-3's isn't published).
 - Live smoke tests still owed: `!mari`/`!rei`/`!asuka` round-trips, `!french bonjour` (Azure
   fr-FR synth) and `!french how do you say …` (Mistral G2P), inline `[[french:..]]`. **Plus the
