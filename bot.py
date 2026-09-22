@@ -923,7 +923,8 @@ QWEN_PROVIDER = ModelProvider(
     # "Flash Next", are dedicated-GPU-only on Fireworks). ⚠️ Model Studio keys
     # are REGION-LOCKED: the key must be created in US (Virginia) or
     # dashscope-us rejects it. isaic-slack-bot keeps Fireworks 3.8 Max as ITS
-    # default (lab bot, US/ZDR). ⚠️ Owes a live smoke test once the key exists.
+    # default (lab bot, US/ZDR). Live-verified on this config 2026-09-21 (plain
+    # turn + web_search tool round-trip) with the US key shared with grayson-bot.
     backend="alibaba",
     api_key_env="DASHSCOPE_API_KEY",
     base_url="https://dashscope-us.aliyuncs.com/compatible-mode/v1",

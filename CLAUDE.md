@@ -46,7 +46,7 @@ self-contained — you don't need it to pick up the remaining work below.
   in the registry, not `__init__`.
 - **Model slugs drift** — verify in the live libraries (Fireworks retires serverless models on
   ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
-  Alibaba `qwen3.8-flash` (docs only — no key yet), Fireworks `glm-5p3` + the `qwen3p8-max` /
+  Alibaba `qwen3.8-flash` (live on `dashscope-us` 2026-09-21), Fireworks `glm-5p3` + the `qwen3p8-max` /
   `deepseek-v4p1-flash` backend toggles (under `accounts/fireworks/models/`). 2026-08-02: Claude
   `claude-opus-5`, Gemini `gemini-3.1-pro-preview` (still no stable 3.1-pro), Moonshot
   `kimi-k3`. Mistral on its own API uses `mistral-large-latest` (→ Mistral Large 3, released
@@ -94,10 +94,18 @@ was verified with live calls (plain turn + web_search tool round-trip).
   `backends["fireworks"]`. **isaic-slack-bot deliberately differs:** Fireworks 3.8 Max is its default,
   still auto-routed (Sarah's call). Only Alibaba serves 3.8 Flash (its open "Flash Next" weights are
   dedicated-GPU-only on Fireworks). `_BACKEND_FIELD_MAP` gained `max_context_tokens` +
-  `est_wh_per_1k_tokens` so a backend carries its own model's context/energy. ⚠️ **Owes a live smoke
-  test** — no DashScope key yet, so Rei is DISABLED on Discord until `DASHSCOPE_API_KEY` is set (set
-  `providers.qwen.backend="fireworks"` to run 3.8 Max meanwhile). Thinks by default like the Fireworks
-  Qwen (`enable_thinking` in extra_body toggles it; reasoning echo optional).
+  `est_wh_per_1k_tokens` so a backend carries its own model's context/energy. Thinks by default like
+  the Fireworks Qwen (`enable_thinking` in extra_body toggles it; reasoning echo optional).
+  ✅ **Key set + live-verified (2026-09-21/22):** no new Alibaba account was needed — grayson-bot
+  already had a US-Virginia DashScope key (`DASHSCOPE_REGION=us-virginia` in its `.env`), and the
+  same key works on `dashscope-us.aliyuncs.com` (no workspace id needed there, unlike grayson's
+  `<workspace>.us-east-1.maas…` URL shape — both verified). Copied into this repo's git-ignored `.env`
+  as `DASHSCOPE_API_KEY`; the registry now logs `🟢 Qwen enabled (model: qwen3.8-flash;
+  backend=alibaba)`. Live checks on Rei's exact config: plain turn with thinking off, and a
+  `web_search` tool round-trip with thinking left at its default (tool call → tool reply → final
+  answer; `prompt_tokens_details.cached_tokens` reported, so `_usage_cache_hits` sees DashScope hits).
+  Still owed: one real `!rei` in Discord once this bot is restarted wherever it runs (it wasn't
+  running on the dev box). To fall back to Fireworks 3.8 Max: `providers.qwen.backend="fireworks"`.
 - **GLM (Asuka)** `glm-5p2` retires 2026-09-25 → `glm-5p3` (same $1.40/$4.40; cached $0.14→$0.26;
   context 200k→1,048,576, so GLM can now take a bookclub text in full).
 - **DeepSeek (Melchior) → V4.1 Flash** (`deepseek-flash`, Sarah's call). DeepSeek's own numbers: Flash
