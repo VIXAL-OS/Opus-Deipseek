@@ -124,6 +124,14 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ web_search tool upgraded to the current variant (2026-11-07)
+All three Claude `web_search` sites moved `web_search_20250305` → **`web_search_20260209`** (dynamic
+filtering; supported on our `claude-opus-5-5`). Do NOT also declare a `code_execution` tool — dynamic
+filtering runs code execution server-side already. ⚠️ **Tools render BEFORE `system`**, so the tool
+definition is inside the `cache_system` breakpoint and gets cached with the prefix (grayson-bot
+measured `web_search`'s definition at 2,794 tokens) — keep the tool list a byte-identical literal per
+call or it invalidates the whole prefix.
+
 ### ✅ Kimi → K3.1 Pro, DeepSeek vision on, prepaid-plan cost mode (2026-11-07)
 Full detail in CLAUDE.md.
 - **Kimi `kimi-k3` → `kimi-k3.1-pro`**: $2.00/$10.00/$0.20 cached vs K3's $3/$15/$0.30 — better and

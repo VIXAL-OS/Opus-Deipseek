@@ -7043,8 +7043,19 @@ Return one JSON object only:
         Anthropic's minimum cacheable length just ignores the marker.
         """
         # Default to giving Claude the web search tool; [] disables it.
+        # `_20260209` is the current variant (dynamic filtering) and is
+        # supported on Opus 5.5/5/4.8/4.7/4.6, Sonnet 5.5/5 and Sonnet 4.6 —
+        # upgraded from the basic `_20250305` on 2026-11-07. Two notes:
+        # dynamic filtering runs code execution server-side under the hood, so
+        # do NOT also declare a code_execution tool (a second execution
+        # environment confuses the model); and on Vertex AI only the basic
+        # variant exists, which doesn't affect us because Claude never runs on
+        # the Vertex backend here (that toggle is Gemini's).
+        # The tool list stays a byte-identical literal per call, which matters:
+        # tools render BEFORE system, so they sit inside the cache_system
+        # breakpoint below and a churning list would invalidate it.
         if tools is None:
-            tools = [{"type": "web_search_20250305", "name": "web_search"}]
+            tools = [{"type": "web_search_20260209", "name": "web_search"}]
 
         try:
 
@@ -7394,7 +7405,7 @@ Return one JSON object only:
                 system=system,
                 messages=messages,
                 tools=[{
-                    "type": "web_search_20250305",
+                    "type": "web_search_20260209",
                     "name": "web_search"
                 }]
             )
@@ -7436,7 +7447,7 @@ Return one JSON object only:
                     system=system,
                     messages=messages,
                     tools=[{
-                        "type": "web_search_20250305",
+                        "type": "web_search_20260209",
                         "name": "web_search"
                     }]
                 )

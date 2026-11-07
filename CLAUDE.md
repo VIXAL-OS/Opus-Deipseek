@@ -147,6 +147,19 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ web_search tool upgraded to the current variant (2026-11-07)
+All three Claude `web_search` sites (`_generate_claude_response`'s default + both `_web_search` creates)
+moved `web_search_20250305` → **`web_search_20260209`**, the current variant with dynamic filtering.
+Supported on Opus 5.5/5/4.8/4.7/4.6, Sonnet 5.5/5 and Sonnet 4.6, so our `claude-opus-5-5` qualifies.
+Two caveats recorded at the call site: dynamic filtering runs code execution server-side under the
+hood, so a `code_execution` tool must NOT also be declared (two execution environments confuse the
+model); and on Vertex only the basic variant exists — irrelevant here because Claude never runs on the
+Vertex backend (that toggle is Gemini's). ⚠️ Worth knowing for the cache work above: **tools render
+BEFORE `system`**, so the tool definition sits inside the `cache_system` breakpoint and is cached with
+the prefix — the sibling grayson-bot measured `web_search`'s definition at **2,794 tokens**, which is
+why the list must stay a byte-identical literal per call. A churning tool list would invalidate the
+whole prefix. Owes the same live smoke test as the cache work.
+
 ### ✅ Kimi → K3.1 Pro, DeepSeek vision on, prepaid-plan cost mode (2026-11-07)
 - **Kimi moved `kimi-k3` → `kimi-k3.1-pro`** (Moonshot's flagship, launched 2026-10-23). Both better
   AND cheaper, which is rare: **$2.00/$10.00 with $0.20 cached**, against K3's $3/$15/$0.30. Prices
