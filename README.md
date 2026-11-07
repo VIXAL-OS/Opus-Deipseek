@@ -1,6 +1,6 @@
 # Hydra Discord Bot (Opus-Deipseek)
 
-A multi-model Discord bot powered by **Claude Opus 5**, **DeepSeek V4.1 Flash**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Four open-weight heads join too: **GLM 5.3** via Fireworks AI (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, **Qwen 3.8 Flash** via Alibaba Model Studio's US (Virginia) region when `DASHSCOPE_API_KEY` is set, **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set, and **Kimi K3** (Moonshot's 2.8T-param flagship, 1M context) via `api.moonshot.ai` when `MOONSHOT_API_KEY` is set.
+A multi-model Discord bot powered by **Claude Opus 5.5**, **DeepSeek V4.1 Flash**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Four open-weight heads join too: **GLM 5.3** via Fireworks AI (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, **Qwen 3.8 Flash** via Alibaba Model Studio's US (Virginia) region when `DASHSCOPE_API_KEY` is set, **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set, and **Kimi K3** (Moonshot's 2.8T-param flagship, 1M context) via `api.moonshot.ai` when `MOONSHOT_API_KEY` is set.
 
 Affectionately maps to the EVA *MAGI* trinity, with the open-weight heads as the pilots you deploy:
 - **Claude / Balthasar** — careful, thorough, vision, native Anthropic web search, multi-tool orchestration
@@ -203,7 +203,7 @@ Pin a long text (fic, paper, contract) to a channel; all three models discuss it
 
 Each provider handles prompt caching differently — the bot abstracts over all three:
 
-- **Claude**: `cache_control: {"type": "ephemeral"}` on the reading-material system block. ~10% pricing on cache hits ($1.50/M vs $15/M input).
+- **Claude Opus 5.5**: `cache_control: {"type": "ephemeral"}` on the reading-material system block. Cache reads cost $0.20/M versus $4/M uncached input; five-minute writes cost $5/M.
 - **Gemini**: Explicit `cachedContents` created via aiohttp to the native API at first turn; subsequent turns reference it via `cachedContent` (the OpenAI shim doesn't support this, so we route Gemini bookclub chat through the native endpoint). ~25% pricing on cache hits.
 - **DeepSeek**: Automatic server-side prefix caching — no client flags required. ~99% pricing discount on cache hits ($0.003625/M vs $0.435/M).
 
@@ -318,17 +318,36 @@ You can also edit this **live from Discord** (guild owner / admin): `!server_con
 python bot.py
 ```
 
+### Windows startup
+
+`HydraOpusDeipseekAutostart` starts the bot one minute after Windows sign-in,
+matching Ressapanda's logon setup. It runs hidden under the signed-in user,
+uses this checkout's `.venv` and working directory, and writes UTF-8 output to
+the git-ignored `logs/boot_*_stdout.log` and `logs/boot_*_stderr.log` files.
+
+To install or update the task on this computer:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\install_startup.ps1
+```
+
+For a manual background launch, use `tools\launch_bot.ps1`; it checks for an
+existing instance and serializes simultaneous launches. Add `-CheckOnly` to
+validate the setup without starting anything. This is a sign-in trigger, so
+the bot starts after login rather than before anyone signs in. Task Scheduler
+can disable or remove `HydraOpusDeipseekAutostart` if autostart is no longer wanted.
+
 The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini, Mistral, Qwen, GLM, Kimi} depending on which API keys are present. `FIREWORKS_API_KEY` gates GLM; `DASHSCOPE_API_KEY` gates Qwen (or `FIREWORKS_API_KEY` on its `fireworks` backend); `MISTRAL_API_KEY` gates Mistral (its own EU API); `MOONSHOT_API_KEY` gates Kimi. Each missing key disables exactly its provider(s) and leaves the rest untouched.
 
 ## Cost Comparison
 
 | Model | Input | Cached input | Output | Typical chat | Bookclub (320k cached) |
 |-------|-------|--------------|--------|--------------|------------------------|
-| Claude Opus 5 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
+| Claude Opus 5.5 | $4/M | $0.20/M (5%) | $20/M | Depends on thinking/output | $0.064 cached input + output |
 | Gemini 3.1 Pro | $2-4/M (tiered ≤/>200k) | $0.50-1.00/M (25%) | $12-18/M | ~$0.01-0.02 | ~$0.40/turn after cache |
 | DeepSeek V4.1 Flash (2× at peak hours) | $0.15/M | $0.003/M (~98%) | $0.60/M | ~$0.0005-0.002 | ~$0.002/turn after cache |
 | Mistral Large 3 (own API) | $0.50/M | — | $1.50/M | ~$0.001-0.004 | — |
-| Qwen 3.8 Flash (Alibaba US) | $0.113/M | ~$0.011/M (~10%) | $0.382/M | ~$0.0005-0.002 | ~$0.004/turn after cache |
+| Qwen 3.8 Flash (Alibaba US) | $0.113/M | $0.014/M | $0.382/M | ~$0.0005-0.002 | ~$0.0045 cached input + output |
 | GLM 5.3 (Fireworks) | $1.40/M | $0.26/M (~19%) | $4.40/M | ~$0.003-0.008 | ~$0.09/turn after cache |
 | Kimi K3 (Moonshot API) | $3.00/M | $0.30/M (auto, 90%) | $15.00/M | ~$0.02-0.06 | ~$0.11/turn after cache |
 
@@ -336,7 +355,11 @@ These open-head rows are estimates — verify on the [Fireworks pricing page](ht
 
 DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Qwen catches routine code/math cheaply; Mistral is the French/EU specialist. Use `!cost` to see a real-time breakdown including cache hit rates and a rough per-provider energy/CO₂ estimate (grid carbon intensity follows the *endpoint*, not the brand — Mistral on its own EU API runs on France's ~nuclear grid (~20 g/kWh), while the Fireworks heads are US (~400)).
 
-Caching is the difference between $5/turn and $0.50/turn for Claude bookclub mode, so it matters. The bot tracks cached and uncached tokens separately and reports the hit rate per provider.
+For a 320k-token Claude bookclub prefix, cache reads cost $0.064 instead of $1.28 in uncached input, plus output and any cache writes. The bot tracks cached and uncached tokens separately. Its dollar ledger preserves the previous historical estimate when migrating to Opus 5.5 and meters new calls at current rates, including cache-write surcharges.
+
+Opus 5.5 migration and pricing were verified on 2026-10-05 against the [migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide) and [Opus pricing](https://www.anthropic.com/claude-opus-5-5). Qwen's $0.014/M cache rate is explicitly listed for [US Virginia](https://www.alibabacloud.com/help/en/model-studio/qwen3-8-flash). Summaries now use adaptive-low with room for thinking and select text blocks safely; empty, refused or truncated summaries are not stored.
+
+FireRouter remains a separate experiment: see the [evaluation plan](docs/firerouter-evaluation.md) and dry-run-first `scratchpad/eval_firerouter.py`. Production routing and named heads are unchanged.
 
 ## Architecture
 

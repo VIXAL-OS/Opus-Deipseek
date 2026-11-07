@@ -28,8 +28,8 @@ Setup:
 3. Create config.json with allowed_channels list
 4. python bot.py
 
-Cost estimate: ~$0.02-0.05 per message with Opus 5 (Claude); cheaper on Deepseek;
-Gemini sits in between depending on context size.
+Opus 5.5 rates: $4/M input, $20/M output, $0.20/M cache reads.
+Per-turn cost depends on context, caching and thinking/output tokens.
 """
 
 import discord
@@ -485,6 +485,9 @@ class ModelProvider:
     # Extra $ billed for requests made inside a peak window (see
     # peak_windows_utc): (peak_multiplier - 1) × their base-rate cost.
     total_peak_surcharge: float = 0.0
+    # Token dollars metered at each call's rates; None supports unsaved counters.
+    # This prevents a model upgrade from repricing lifetime token history.
+    total_token_cost: Optional[float] = None
 
     def is_peak(self, when: Optional[datetime] = None) -> bool:
         """True if `when` (default: now) falls in one of this provider's
@@ -522,7 +525,9 @@ class ModelProvider:
         `when` (default now) decides peak vs off-peak for time-of-day pricing.
         """
         peak = self.is_peak(when)
-        base_before = self._token_cost() if peak else 0.0
+        base_before = self._token_cost()
+        if self.total_token_cost is None:
+            self.total_token_cost = base_before
         request_size = input_tokens + cached_input_tokens
         if (
             self.context_tier_threshold is not None
@@ -535,6 +540,7 @@ class ModelProvider:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.total_cached_input_tokens += cached_input_tokens
+        self.total_token_cost += self._token_cost() - base_before
         if peak:
             # This request's base-rate cost is the delta it just added; bill the
             # rest of the peak price on top as a surcharge.
@@ -547,7 +553,8 @@ class ModelProvider:
         states, including any peak-hour surcharge."""
         if self.cost_mode == "local":
             return 0.0
-        return self._token_cost() + self.total_peak_surcharge
+        token_cost = self._token_cost() if self.total_token_cost is None else self.total_token_cost
+        return token_cost + self.total_peak_surcharge
 
     def _token_cost(self) -> float:
         """Recorded tokens priced at the base (off-peak) rates."""
@@ -631,6 +638,7 @@ class ModelProvider:
             "requests": self.total_requests,
             "cache_storage_cost_est": self.total_cache_storage_cost_est,
             "peak_surcharge": self.total_peak_surcharge,
+            "token_cost": self._token_cost() if self.total_token_cost is None else self.total_token_cost,
         }
 
     def load_stats(self, data: dict) -> None:
@@ -643,6 +651,17 @@ class ModelProvider:
         self.total_requests = data.get("requests", 0)
         self.total_cache_storage_cost_est = data.get("cache_storage_cost_est", 0.0)
         self.total_peak_surcharge = data.get("peak_surcharge", 0.0)
+        self.total_token_cost = data.get("token_cost")
+        if self.total_token_cost is None:
+            if self.id == "claude":
+                # Pre-5.5 saves have no dollar ledger: preserve their old estimate.
+                self.total_token_cost = (
+                    (self.total_input_tokens + self.total_input_tokens_above_tier) * 5.0
+                    + (self.total_output_tokens + self.total_output_tokens_above_tier) * 25.0
+                    + (self.total_cached_input_tokens + self.total_cached_input_tokens_above_tier) * 0.5
+                ) / 1_000_000
+            else:
+                self.total_token_cost = self._token_cost()
 
 
 @dataclass
@@ -702,13 +721,12 @@ CLAUDE_PROVIDER = ModelProvider(
     id="claude",
     sdk_type="anthropic",
     api_key_env="ANTHROPIC_API_KEY",
-    model_id="claude-opus-5",
-    input_cost_per_million=5.0,
-    output_cost_per_million=25.0,
-    # cache_read_input_tokens bill at 10% of standard input rate. (Cache
-    # writes on the first turn are billed at 1.25x; we lump those into the
-    # regular input counter — a small under-bill once per session.)
-    cached_input_cost_per_million=0.5,
+    model_id="claude-opus-5-5",
+    input_cost_per_million=4.0,
+    output_cost_per_million=20.0,
+    # Opus 5.5 pricing verified 2026-10-05: reads $0.20/M; 5m writes $5/M.
+    # _record_claude_usage adds the write surcharge separately.
+    cached_input_cost_per_million=0.2,
     max_context_tokens=1_000_000,  # 1M GA'd for Opus 4.6+ in March 2026
     supports_vision=True,
     supports_web_search=True,
@@ -935,7 +953,7 @@ QWEN_PROVIDER = ModelProvider(
     # extra_body; reasoning_content echo optional) — same as the Fireworks Qwen.
     input_cost_per_million=0.113,
     output_cost_per_million=0.382,
-    cached_input_cost_per_million=0.0113,  # implicit-cache hit ≈10% — VERIFY (docs list $0.014, likely Singapore)
+    cached_input_cost_per_million=0.014,  # US Virginia implicit cache, verified 2026-10-05
     max_context_tokens=1_000_000,
     supports_vision=False,
     supports_web_search=False,
@@ -2237,7 +2255,16 @@ class ConversationManager:
         lines = ["**Other recent threads in this channel** (for context):"]
         
         for thread in threads_info:
-            # Calculate age
+            # Calculate age. ⚠️ CACHE INVARIANT: these age strings are
+            # MINUTE-granular, so this whole block changes every 60s while a
+            # thread is fresh. It must stay DOWNSTREAM of any cached prefix —
+            # _generate_response appends it to the newest user turn via
+            # _append_volatile_context for exactly this reason. Putting it back
+            # in the system message re-bills the full prompt (history included)
+            # on every tick; prefix caches match the longest common prefix, so
+            # a change here invalidates everything after it. Minute precision is
+            # genuinely useful for recency — it is the PLACEMENT that has to be
+            # right, not the granularity.
             age = datetime.now(thread.created_at.tzinfo) - thread.created_at if thread.created_at else None
             if age:
                 if age.days > 0:
@@ -2976,15 +3003,12 @@ class ClaudeBot(commands.Bot):
     }
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
-    # Plain (non-!think) Claude turns on Opus 5 run ADAPTIVE thinking at this
-    # effort (Sarah's call 2026-08-02, replacing the brief post-migration
-    # disabled-thinking shim). "low" keeps casual chat snappy and cheap —
-    # Opus 5 at low effort still beats prior-gen high — while !think and the
-    # auto-effort heuristic stay the escalation to high|xhigh|max. Applies to
-    # every thinking=False Claude call: plain chat, !search, panel members,
-    # bookclub recaps. (!summarize keeps thinking hard-disabled — 200-token cap.)
+    # Plain Claude turns keep adaptive-low (Sarah's call 2026-08-02).
+    # !think and the auto-effort heuristic escalate to high|xhigh|max.
+    # Applies to plain chat, !search, panel members and bookclub recaps;
+    # !summarize also uses adaptive-low, with a separate 4096-token budget.
     CLAUDE_PLAIN_EFFORT = "low"
-    CLAUDE_PLAIN_MAX_TOKENS = 8192  # thinking + reply share max_tokens on Opus 5 → headroom over the old 4096
+    CLAUDE_PLAIN_MAX_TOKENS = 8192  # thinking and visible reply share the budget
 
     def _store_reasoning(self, msg_id: int, content: str) -> None:
         """Cache reasoning_content under a Discord message id (FIFO eviction)."""
@@ -3004,10 +3028,10 @@ class ClaudeBot(commands.Bot):
 
         Anthropic's response.usage carries input_tokens (uncached only),
         output_tokens, and two optional cache counters:
-        cache_read_input_tokens (10% of input rate) and
-        cache_creation_input_tokens (~125% — small surcharge that funds
-        cheap reads). We bucket reads into the cached counter and lump
-        creation into regular input (a small one-time under-bill).
+        cache_read_input_tokens ($0.20/M on Opus 5.5) and
+        cache_creation_input_tokens (5m writes at 125%, 1h writes at 200%).
+        Creation tokens count as input for energy; their extra cost is metered
+        separately. Old saves retain their previous cost estimate.
 
         count_request controls whether to bump total_requests — set False
         for the tool-use loop continuation rounds so a single user turn
@@ -3022,6 +3046,12 @@ class ClaudeBot(commands.Bot):
             output_tokens,
             cached_input_tokens=cache_read,
         )
+        creation = getattr(usage, "cache_creation", None)
+        one_hour = min(cache_creation, getattr(creation, "ephemeral_1h_input_tokens", 0) or 0)
+        if self.claude_provider.cost_mode != "local":
+            self.claude_provider.total_token_cost += (
+                (cache_creation - one_hour) * 0.25 + one_hour
+            ) * self.claude_provider.input_cost_per_million / 1_000_000
         if count_request:
             self.claude_provider.total_requests += 1
 
@@ -5345,6 +5375,41 @@ Return one JSON object only:
             last["content"] = list(content) + [{"type": "text", "text": extract_block}]
 
     @staticmethod
+    def _append_volatile_context(messages: list[dict], volatile_context: str) -> bool:
+        """Append per-turn context to the newest user turn, in-place.
+
+        This is the cache-safe home for anything that churns between turns —
+        the thread index, memory, the sparse-memory nudge. Appended here it
+        sits at the very END of the prompt, so the stable system prompt and the
+        whole preceding history stay a byte-identical prefix that each
+        provider's automatic prefix cache can reuse. The same text placed in
+        the system message instead invalidates the cache for the entire prompt
+        on any turn where it changes, history included.
+
+        Returns True when the block landed; False (changing nothing) when the
+        last turn isn't a user message, leaving the caller to fall back to
+        system-prompt placement. Mirrors _augment_with_url_extracts, which
+        appends to the same turn for the same reason.
+        """
+        if not messages or not volatile_context:
+            return False
+        last = messages[-1]
+        if last.get("role") != "user":
+            return False
+        content = last.get("content", "")
+        block = (
+            "\n\n---\n[Current channel context — regenerated each turn, "
+            f"not part of the conversation:]\n{volatile_context}\n---\n"
+        )
+        if isinstance(content, str):
+            last["content"] = content + block
+        elif isinstance(content, list):
+            last["content"] = list(content) + [{"type": "text", "text": block}]
+        else:
+            return False
+        return True
+
+    @staticmethod
     def _has_cjk(text: str) -> bool:
         """Check if text contains Chinese/Japanese/Korean characters."""
         return any('\u4e00' <= c <= '\u9fff'  # CJK Unified Ideographs
@@ -5624,7 +5689,14 @@ Return one JSON object only:
         if reading_material is not None:
             system = self._build_reading_material_system_block(reading_material) + "\n\n" + system
 
-        # Prepend system message (OpenAI uses it as first message)
+        # Prepend system message (OpenAI uses it as first message).
+        # ⚠️ This is the head of the prompt, so it is also the head of every
+        # automatic prefix cache (DeepSeek, Qwen, GLM, Kimi, Mistral, shim
+        # Gemini). Keep it STABLE across turns: `system` must stay the
+        # cacheable prefix, with per-turn churn appended to the newest user
+        # turn by _append_volatile_context instead. The "~free" claim above
+        # depends on that — it held for the fic (always first) but was false
+        # for everything after the thread index until that block moved out.
         openai_messages.insert(0, {"role": "system", "content": system})
 
         # Include web search tool if Tavily is available
@@ -6533,29 +6605,51 @@ Return one JSON object only:
         # links and gives Claude a deterministic copy alongside its web_search.
         await self._augment_with_url_extracts(messages)
 
-        # Build system prompt with all context sources
-        system_parts = [self._build_system_prompt(provider, routing_reason, guild_id=guild_id)]
+        # Build the system prompt. CACHE DISCIPLINE (load-bearing — read before
+        # reordering): every provider but Claude does AUTOMATIC prefix caching,
+        # and a prefix cache matches on the LONGEST COMMON PREFIX. Anything that
+        # churns turn-to-turn must therefore sit DOWNSTREAM of everything stable,
+        # because the changed bytes invalidate the cache for themselves AND for
+        # every token after them — including the entire conversation history.
+        #
+        # So the prompt is split in two:
+        #   stable_system   — persona / server context / plurality. Byte-identical
+        #                     across turns in a channel, so it stays the cacheable
+        #                     prefix (and carries Claude's cache_control marker).
+        #   volatile_context — thread index (per-thread ages tick every MINUTE),
+        #                     memory (changes whenever a [note:] lands), and the
+        #                     sparse-memory nudge (appears/disappears at the <3
+        #                     boundary). Appended to the TAIL of the prompt
+        #                     instead, where churn is free because it rides with
+        #                     the new user turn.
+        # These three used to be joined into the system message ahead of the
+        # history, which silently re-billed the whole prompt at full input price
+        # on any turn where a thread age ticked over or a note was written.
+        stable_system = self._build_system_prompt(provider, routing_reason, guild_id=guild_id)
+
+        volatile_parts: list[str] = []
 
         # 1. Thread index (READ-ONLY - prevents feedback loops)
         thread_index = await self.manager.fetch_thread_index(channel)
         if thread_index:
-            system_parts.append(thread_index)
+            volatile_parts.append(thread_index)
 
         # 2. Memory (both tiers)
         memory_context = self.manager.memories[guild_id].get_context_string()
         if memory_context:
-            system_parts.append(memory_context)
+            volatile_parts.append(memory_context)
 
         # 3. Gentle nudge if working memory is sparse
         working_note_count = len(self.manager.memories[guild_id].working.notes)
         if working_note_count < 3:
-            system_parts.append(
+            volatile_parts.append(
                 "📝 *Reminder: Your working memory is pretty empty. "
                 "If anything noteworthy comes up in this conversation, "
                 "jot it down with [note: key: value].*"
             )
 
-        system = "\n\n".join(system_parts)
+        volatile_context = "\n\n".join(volatile_parts)
+        system = stable_system
 
         # Look up reading material pinned to this channel (bookclub mode).
         # Use parent channel for threads so a thread inside a bookclub
@@ -6579,10 +6673,30 @@ Return one JSON object only:
         # message-splitting / posting / LaTeX downstream are unchanged. Reuses
         # the reading-material + URL/search context assembled above (§9.2).
         if provider.completions_mode:
+            # The simulator keeps the volatile context in its PREAMBLE rather
+            # than the tail: a base model's preamble is already out-of-band
+            # framing, whereas the tail of a sim prompt is transcript body, and
+            # a memory/thread-index block rendered inside a `<speaker> body`
+            # line would read as something a user actually said. Nothing is lost
+            # — the sim rebuilds its whole transcript each turn anyway, so there
+            # is no prefix cache here to protect.
+            sim_system = (
+                f"{system}\n\n{volatile_context}" if volatile_context else system
+            )
             return await self._generate_simulator_response(
-                provider, guild_id, messages, system,
+                provider, guild_id, messages, sim_system,
                 reading_material=reading_material,
             )
+
+        # Move the volatile context to the TAIL of the prompt (see the cache
+        # discipline note above). On the common path it rides along with the
+        # newest user turn, so the stable system prompt AND the whole history
+        # stay a reusable prefix. If the last turn isn't a user message there is
+        # no tail to attach it to, so fall back to the old system-prompt
+        # placement — correct, just uncached, exactly as before this change.
+        if volatile_context:
+            if not self._append_volatile_context(messages, volatile_context):
+                system = f"{system}\n\n{volatile_context}"
 
         # Dispatch on sdk_type (Phase 0 registry). Behavior is preserved:
         # - gemini + vertex backend → native Vertex path (Phase 2; handles
@@ -6640,6 +6754,7 @@ Return one JSON object only:
         effort: Optional[str] = None,
         reading_material: Optional["ReadingMaterial"] = None,
         tools: Optional[list] = None,
+        cache_system: bool = True,
     ) -> tuple[str, list[str], str]:
         """Generate a response from Claude via the native Anthropic SDK.
 
@@ -6647,6 +6762,16 @@ Return one JSON object only:
         panel/judge) can call Claude directly. tools=None gives Claude its
         default web_search tool; pass tools=[] to disable web search (e.g. the
         judge synthesis step). Returns (response_text, reactions, reasoning).
+
+        cache_system marks the system prompt as a cache breakpoint. Unlike
+        every other head, Claude does NOT cache automatically — it caches only
+        what carries an explicit cache_control marker. Worth it when the same
+        system prompt recurs turn after turn (channel chat: $0.20/M reads vs
+        $4/M input, 20x), but a loss for a one-shot prompt that will never be
+        read back, since a cache WRITE costs more than plain input ($5/M at the
+        5-minute TTL). So the panel and judge pass cache_system=False: their
+        system prompts are built per call and never repeat. A prompt below
+        Anthropic's minimum cacheable length just ignores the marker.
         """
         # Default to giving Claude the web search tool; [] disables it.
         if tools is None:
@@ -6658,7 +6783,7 @@ Return one JSON object only:
             # blocks with cache_control on the (very large) fic block. The
             # cache marker tells Anthropic to cache everything up through
             # that block; subsequent requests with the same fic hit the
-            # cache at ~10% pricing.
+            # cache at the configured read rate (5% on Opus 5.5).
             if reading_material is not None:
                 fic_block_text = self._build_reading_material_system_block(reading_material)
                 claude_system = [
@@ -6669,6 +6794,17 @@ Return one JSON object only:
                     },
                     {"type": "text", "text": system},
                 ]
+                if cache_system:
+                    # Extend the cached prefix over the system prompt too, so a
+                    # bookclub turn re-reads BOTH the fic and the framing. Safe
+                    # now that the churning blocks live at the prompt tail.
+                    claude_system[1]["cache_control"] = {"type": "ephemeral"}
+            elif cache_system:
+                claude_system = [{
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }]
             else:
                 claude_system = system
 
@@ -6680,7 +6816,7 @@ Return one JSON object only:
             if tools:
                 claude_kwargs["tools"] = tools
             if thinking:
-                # Adaptive thinking on Opus 5: model decides depth; effort
+                # Adaptive thinking on Opus 5.5: model decides depth; effort
                 # controls overall thinking/acting budget. effort=None falls
                 # back to the class default ("high"). xhigh/max need ≥64K
                 # max_tokens or they truncate mid-thought.
@@ -6712,11 +6848,11 @@ Return one JSON object only:
             )
 
             # Track usage. Claude's response.usage exposes cache info as
-            # separate counters: cache_read_input_tokens (10% of input rate)
+            # separate counters: cache_read_input_tokens (5% of input rate on Opus 5.5)
             # and cache_creation_input_tokens (125% of input rate — billed at
             # a small surcharge to fund the cheap reads). We bucket
             # cache_read into the cached counter and lump cache_creation into
-            # regular input (a small one-time under-bill per cache lifetime).
+            # regular input, with the write surcharge metered separately.
             self._record_claude_usage(response.usage)
 
             # Handle tool use loop — Claude may decide to search the web.
@@ -6819,6 +6955,11 @@ Return one JSON object only:
         if provider is self.claude_provider:
             text, _, _ = await self._generate_claude_response(
                 guild_id, messages, system, tools=claude_tools, thinking=thinking,
+                # cache_system=False: a panel member's / the judge's system
+                # prompt is assembled per call around that one question and is
+                # never read back, so a cache WRITE here would cost more than
+                # plain input and buy nothing.
+                cache_system=False,
             )
             return text
         client = self.openai_compatible_clients.get(provider.name)
@@ -8338,22 +8479,28 @@ Return one JSON object only:
                         summary_response = await asyncio.to_thread(
                             self.claude_client.messages.create,
                             model=self.claude_provider.model_id,
-                            max_tokens=200,
-                            # Must stay disabled on Opus 5: default-on adaptive
-                            # thinking would both blow the 200-token cap and put
-                            # a thinking block at content[0] (crashing .text).
-                            thinking={"type": "disabled"},
+                            # Thinking shares the output budget on Opus 5.5.
+                            max_tokens=4096,
+                            thinking={"type": "adaptive"},
+                            extra_body={"output_config": {"effort": "low"}},
                             system="Summarize this conversation in 1-2 sentences. Focus on the key topic and any decisions/outcomes. Be concise.",
                             messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
-                        summary = summary_response.content[0].text.strip()
+                        # Account even for a refused or truncated response.
+                        self._record_claude_usage(summary_response.usage)
+                        summary = "".join(
+                            block.text for block in summary_response.content
+                            if getattr(block, "type", None) == "text"
+                        ).strip()
                         # Safety net: strip any [note:] tag so it can't leak into
                         # the saved summary or the confirmation message.
                         summary = self._extract_notes(summary, guild_id).strip()
 
-                        # Track usage (cache info goes through the helper too)
-                        self._record_claude_usage(summary_response.usage)
-                        
+                        if not summary or summary_response.stop_reason in ("max_tokens", "refusal"):
+                            self.manager.save_memories(providers=self.usage_providers)
+                            await message.channel.send("❌ Claude did not produce a complete summary. Nothing was saved; try again.")
+                            return
+
                         if memory.longterm.add(f"thread_{key}", summary):
                             self.manager.save_memories(providers=self.usage_providers)
                             await message.channel.send(f"✅ Saved: `thread_{key}`: {summary}")

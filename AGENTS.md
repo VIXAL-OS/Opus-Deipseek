@@ -11,6 +11,45 @@ This file is the working status + remaining-work tracker for the "Hydra Restruct
 spec. The full spec lives outside the repo (Sarah's Codex.ai artifact); this file is
 self-contained — you don't need it to pick up the remaining work below.
 
+## Opus 5.5 migration — 2026-10-05
+
+- Claude uses `claude-opus-5-5`, $4/M input, $20/M output, $0.20/M cache reads.
+  Five-minute cache writes cost $5/M; one-hour writes cost $8/M.
+- `!summarize` uses adaptive-low and a 4096-token budget, selects text blocks,
+  and refuses to store empty, refused or truncated output. Other Claude effort
+  choices are retained; signed tool continuations keep their original context.
+- `ModelProvider.total_token_cost` persists token dollars rather than repricing
+  lifetime counters after a model upgrade. Old Claude saves retain their former
+  $5/$25/$0.50 estimate. Cache-write surcharges are included for new calls.
+- Hydra's Alibaba US Qwen cache rate is confirmed at $0.014/M. ISAIC's Fireworks
+  Qwen backend retains its separate rates.
+- The sibling ISAIC and companion checkouts receive the corresponding migration.
+  The older `E:\Documents\Stuff\isaic-slack-bot` checkout was removed at the user's
+  request after verifying it was clean and its HEAD was in the retained checkout.
+- FireRouter is a standalone, dry-run-first pilot in `scratchpad/eval_firerouter.py`;
+  see `docs/firerouter-evaluation.md`. Production routing, personas and provider
+  identities are unchanged. No live FireRouter evaluation has run.
+- Offline migration regressions: `scratchpad/test_opus55.py`. The runner has
+  separate no-network checks in `scratchpad/test_eval_firerouter.py`.
+- Validation: migration/provider/panel/participation checks pass in Hydra and
+  ISAIC; companion's full 67-test suite passes. Three synthetic live Opus 5.5
+  checks passed (low, high, summary; $0.002104 total token cost). Windows startup
+  validation below also confirmed Discord login; Slack remains offline-validated.
+
+## Windows autostart — 2026-10-05
+
+- Task `HydraOpusDeipseekAutostart` runs one minute after the user's Windows login,
+  matching Ressapanda. It uses the interactive user's normal privileges, with no
+  stored password, and permits battery operation.
+- `tools/launch_bot.ps1` is the background launch entry point: correct `.venv` and
+  working directory, hidden window, UTF-8/unbuffered logs under ignored `logs/`,
+  a launcher mutex and a running-process check to avoid duplicate Discord clients.
+- `tools/install_startup.ps1` installs/updates this checkout's task. The task is a
+  logon launcher, not a crash-restarting service. `-CheckOnly` on the launcher
+  validates prerequisites without starting the bot.
+- Verified: task exit code 0, Discord login with Opus 5.5, and a second invocation
+  kept the original Python parent/child pair without creating another log.
+
 ## Run / verify
 - `python bot.py` — needs `.env` (`DISCORD_TOKEN` + ≥1 model key) and `config.json`
   (`allowed_channels`, `default_model`).
@@ -40,6 +79,18 @@ self-contained — you don't need it to pick up the remaining work below.
   `CachedContent` when `backend="vertex"`); everything else → the OpenAI-compatible shim
   (`_generate_openai_compatible_response`) via `self.clients[provider.id]`. Per-provider wiring lives
   in the registry, not `__init__`.
+- **Prompt-cache discipline — the system prompt must stay byte-identical across turns.** Every head
+  but Claude does AUTOMATIC prefix caching, and a prefix cache matches the LONGEST COMMON PREFIX, so
+  anything that churns turn-to-turn must sit DOWNSTREAM of everything stable — a change near the front
+  invalidates the cache for itself *and every token after it*, conversation history included.
+  `_generate_response` therefore splits the prompt: `stable_system` (persona/server context/plurality)
+  stays the cached prefix, and `volatile_context` (thread index — ages tick every MINUTE; memory —
+  changes on every `[note:]`; the sparse-memory nudge — flips at the `<3` boundary) is appended to the
+  newest user turn by `_append_volatile_context`. **Do NOT move those blocks back into the system
+  message** (that was the bug fixed 2026-11-07). Claude is the exception — it caches ONLY what carries
+  an explicit `cache_control`, so `_generate_claude_response(cache_system=True)` marks the stable
+  prefix; the panel/judge pass `cache_system=False` because a one-shot prompt pays the cache-WRITE
+  premium ($5/M) and is never read back. Guarded by `scratchpad/test_prompt_cache_order.py`.
 - **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-09-21):
   `glm-5p3`, `qwen3p8-max`, `deepseek-v4p1-flash` (under `accounts/fireworks/models/`); Qwen's
   default is now `qwen3.8-flash` on Alibaba US and DeepSeek's is `deepseek-flash` (see CLAUDE.md). Mistral on
@@ -71,7 +122,34 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-08-08
+## Status — 2026-11-07
+
+### ✅ Prompt-cache ordering: volatile context moved off the cached prefix (2026-11-07)
+Every head but Claude does automatic prefix caching, matched on the longest common prefix — and
+`_generate_response` was joining three CHURNING blocks into the system message ahead of the history:
+the thread index (per-thread ages are MINUTE-granular, so it changed every 60s while a thread was
+fresh), the memory context (changes on every `[note:]`), and the sparse-memory nudge (appears/
+disappears at the `<3` boundary). Because the system message is the head of the prompt
+(`openai_messages.insert(0, ...)`), any tick invalidated the prefix cache for the *entire* prompt,
+conversation history included — re-billing it at full input price. DeepSeek is $0.003/M cached vs
+$0.15/M miss (50×), Kimi $0.30/M vs $3/M (10×), Qwen $0.014/M cached.
+- **Fix: the prompt is split.** `stable_system` stays the cacheable prefix; `volatile_context` is
+  appended to the newest user turn by the new `_append_volatile_context` helper, mirroring
+  `_augment_with_url_extracts`. One change at the assembly site fixes all five chat dispatch paths at
+  once — no signatures threaded. Falls back to the old system-prompt placement when the newest turn
+  isn't a user message (correct, just uncached, exactly as before).
+- **The simulator deliberately keeps it in the preamble** — the tail of a sim prompt is transcript
+  body, so a memory block there would render inside a `<speaker> body` line as something a user said.
+- **Claude now gets an explicit breakpoint.** New `cache_system` param (default True) marks the stable
+  prefix; the panel/judge pass `cache_system=False` since their prompts are built per call and never
+  read back, so a cache WRITE ($5/M) would cost more than plain input.
+- **Deliberately NOT changed:** age strings stay minute-granular, the nudge keeps its `<3` boundary,
+  and the `!research` judge keeps its `today` date. Once the block sits at the tail that churn is
+  free — it was the PLACEMENT that was wrong, not the granularity. Invariant comments added at all
+  three churn sites.
+- Offline-validated: new `scratchpad/test_prompt_cache_order.py` (31/31). Syntax + import gates pass;
+  all 9 pre-existing harnesses still green. ⚠️ Owes a live smoke test (`!claude` + `!deepseek` in a
+  channel with a live thread, watching `!cost` cache hits climb). Not yet mirrored to isaic-slack-bot.
 
 ### ✅ Speaker-aware session → ambient participation gate (2026-08-08)
 The bot no longer commissions a model reply for every eligible human message. A channel-level social
