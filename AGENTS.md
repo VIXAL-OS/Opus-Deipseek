@@ -124,6 +124,27 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ `!cost` rewritten: ranked by cost AND carbon, with everyday equivalents (2026-11-07)
+Full detail in CLAUDE.md. The old layout listed providers in **registry order**, three lines each,
+which buried the one surprising thing in the data: **cost and carbon rank differently.** On real
+figures Claude is 59% of spend but 15% of emissions; DeepSeek is 3% of spend and **83% of
+emissions** — cheap head, dirty grid, far more tokens.
+- **Two rankings side by side** in a fenced block (Discord preserves the alignment), then the total,
+  then the carbon line, then a per-provider **Detail** section. Insight first, precision after.
+  Nothing from the old format was dropped — tokens, cache hit rates, Gemini cache storage, the
+  `local` label, the prepaid-plan footer, peak surcharge and per-request tool spend all live in
+  Detail, each pinned by the harness.
+- **`_co2_equivalents()`** renders km in an average petrol car (`CO2_G_PER_KM_PETROL_CAR` 250 g/km,
+  from the EPA's ~400 g/mile — **tailpipe only**, so it understates driving, the conservative
+  direction here) and hours of PC gaming on a coal grid (`GAMING_PC_WATTS` 400 W ×
+  `COAL_GRID_GCO2_PER_KWH` 820, IPCC AR5 coal median). Two anchors deliberately — a longer list
+  reads as precision the estimate doesn't have. All three are `.env`-overridable.
+- Rankings use 2dp (`<$0.01` below that); Detail keeps 4dp. A sub-1% share renders `<1%` and a
+  sub-gram mass `<1 g`, because `0%`/`0 g` read as *nothing* rather than *negligible*.
+- Offline: `scratchpad/test_cost_summary_format.py` (23/23 — the rankings really do come out in
+  different orders, equivalents degrade to minutes/metres, every old field survives, all seven heads
+  render in **1,743 chars** against Discord's 2,000).
+
 ### ✅ web_search tool upgraded to the current variant (2026-11-07)
 All three Claude `web_search` sites moved `web_search_20250305` → **`web_search_20260209`** (dynamic
 filtering; supported on our `claude-opus-5-5`). Do NOT also declare a `code_execution` tool — dynamic
