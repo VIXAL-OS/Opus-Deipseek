@@ -806,6 +806,42 @@ GRID_GCO2_PER_KWH = float(os.getenv("GRID_GCO2_PER_KWH", "400"))
 MODEL_LIFETIME_TOKENS = float(os.getenv("MODEL_LIFETIME_TOKENS", "1e14"))
 AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "False", "")
 
+# Everyday equivalents for the !cost carbon line. A number like "7,199 g CO₂e"
+# means nothing to most people; "29 km of driving" is a quantity you have
+# intuitions about. These are ORDER-OF-MAGNITUDE anchors on an estimate that is
+# itself order-of-magnitude, so they inherit all of its error — they exist to
+# make the figure legible, never to make a claim.
+#   - Car: the US EPA's average passenger vehicle is ~400 g CO₂/mile tailpipe,
+#     i.e. ~250 g/km. Tailpipe only; fuel production and the car's own
+#     manufacture would push it higher, so this UNDERSTATES driving and is
+#     therefore the conservative direction for a comparison that flatters us.
+#   - Gaming: a mid-range gaming PC under load draws roughly 400 W, and the
+#     IPCC AR5 lifecycle median for coal power is ~820 g CO₂e/kWh — so ~328 g
+#     per hour on a coal-heavy grid. Chosen because it is a recognisable
+#     "screen doing compute" baseline to compare screen-doing-compute against.
+CO2_G_PER_KM_PETROL_CAR = float(os.getenv("CO2_G_PER_KM_PETROL_CAR", "250"))
+GAMING_PC_WATTS = float(os.getenv("GAMING_PC_WATTS", "400"))
+COAL_GRID_GCO2_PER_KWH = float(os.getenv("COAL_GRID_GCO2_PER_KWH", "820"))
+
+
+def _co2_equivalents(co2_g: float) -> str:
+    """Render a CO₂e mass as everyday equivalents, or '' if too small to bother.
+
+    Deliberately two anchors, not five: a list of comparisons reads as
+    precision the underlying estimate does not have.
+    """
+    if co2_g < 1.0:
+        return ""
+    km = co2_g / CO2_G_PER_KM_PETROL_CAR
+    gaming_h = co2_g / (GAMING_PC_WATTS / 1000.0 * COAL_GRID_GCO2_PER_KWH)
+    car = (f"{km:,.0f} km" if km >= 1 else f"{km * 1000:,.0f} m")
+    if gaming_h >= 1:
+        game = f"{gaming_h:,.0f} h"
+    else:
+        game = f"{gaming_h * 60:,.0f} min"
+    return (f"about the same as driving {car} in an average petrol car, "
+            f"or {game} of PC gaming on a coal-heavy grid")
+
 # Alternation of model display-names (provider.name values) that can show up as
 # echoed "[Name]" labels in model output. The response pipeline strips any of
 # these a model prepends BEFORE the bot adds its own authoritative label, and
@@ -2718,20 +2754,22 @@ class ConversationManager:
         )
     
     def get_cost_summary(self, providers: list[ModelProvider]) -> str:
-        """Get total cost summary across all models, including cache hit rate."""
-        lines = ["💰 **Cost Summary**"]
-        grand_total = 0.0
-        storage_total = 0.0
-        energy_wh_total = 0.0
-        co2_g_total = 0.0
-        train_co2_g_total = 0.0
+        """Cost + carbon summary, ranked, with everyday carbon equivalents.
 
+        The layout is deliberate. The old format listed providers in registry
+        order with three lines each, which buried the one genuinely surprising
+        fact: cost and carbon rank DIFFERENTLY. A cheap head on a dirty grid
+        can be 3% of the bill and 80% of the emissions, and a registry-ordered
+        list hides that completely. So the two rankings lead, side by side,
+        and the per-provider detail follows for when exact numbers are wanted.
+        """
+        now = _utcnow()
         # Live (in-flight) Gemini cache storage. total_cache_storage_cost_est
         # holds only SETTLED storage from caches already torn down; add what
-        # currently-alive caches have accrued so far (created_at → now, capped at
-        # expiry) so the figure tracks the real, growing bill instead of the
-        # stale creation-time guess that used to read cheap while the balance bled.
-        now = _utcnow()
+        # currently-alive caches have accrued so far (created_at -> now, capped
+        # at expiry) so the figure tracks the real, growing bill instead of the
+        # stale creation-time guess that used to read cheap while the balance
+        # bled.
         gemini_live_storage = 0.0
         for mat in self.reading_materials.values():
             for k, created in mat.cache_created_at.items():
@@ -2741,130 +2779,168 @@ class ConversationManager:
                         mat.cache_expires_at.get(k), now,
                     )
 
+        rows = []
         for p in providers:
             storage_est = p.total_cache_storage_cost_est
             if p.name == "Gemini":
                 storage_est += gemini_live_storage
             if p.total_requests == 0 and storage_est == 0.0:
                 continue
-            cost = p.get_cost()
-            grand_total += cost
-            storage_total += storage_est
-            energy_wh = p.get_energy_wh()
-            energy_wh_total += energy_wh
-            co2_g = p.get_co2_g(GRID_GCO2_PER_KWH)
-            co2_g_total += co2_g
-            train_co2_g_total += p.get_amortized_train_co2_g(MODEL_LIFETIME_TOKENS)
-
-            # Sum uncached + cached across both pricing tiers
             uncached_in = p.total_input_tokens + p.total_input_tokens_above_tier
-            cached_in = p.total_cached_input_tokens + p.total_cached_input_tokens_above_tier
-            out_tokens = p.total_output_tokens + p.total_output_tokens_above_tier
-            total_in = uncached_in + cached_in
+            cached_in = (p.total_cached_input_tokens
+                         + p.total_cached_input_tokens_above_tier)
+            rows.append({
+                "p": p,
+                "cost": p.get_cost(),
+                "storage": storage_est,
+                "energy": p.get_energy_wh(),
+                "co2": p.get_co2_g(GRID_GCO2_PER_KWH),
+                "train": p.get_amortized_train_co2_g(MODEL_LIFETIME_TOKENS),
+                "in": uncached_in,
+                "cached": cached_in,
+                "out": p.total_output_tokens + p.total_output_tokens_above_tier,
+            })
 
-            # Hit rate on input tokens (% served from cache)
-            hit_rate = (cached_in / total_in * 100) if total_in > 0 else 0.0
-            cache_note = ""
-            if cached_in > 0:
-                cache_note = f", 🟢 {cached_in:,} cached ({hit_rate:.0f}% hit rate)"
-
-            # Self-hosted / local backends bill electricity, not per token — show
-            # that instead of a $0.0000 that reads like "free". The 🌱 energy
-            # line below still reports (tokens are counted) on the self-host grid.
-            if p.cost_mode == "local":
-                cost_str = "local (no per-token $ — electricity only)"
-            elif p.cost_mode == "plan":
-                # Prepaid allowance: tokens drew down Credits bought up front,
-                # so there is no per-token charge to report. The flat fee rides
-                # in its own footer line, and 🌱 below is unaffected.
-                fee = (f" — ${p.plan_monthly_usd:.2f}/mo flat"
-                       if p.plan_monthly_usd else "")
-                cost_str = f"prepaid plan (no per-token ${fee})"
-            else:
-                cost_str = f"${cost:.4f}"
-            if p.cost_mode != "local" and p.total_peak_surcharge > 0:
-                cost_str += f" (incl. ${p.total_peak_surcharge:.4f} peak-hour surcharge)"
-            # Per-request server-side tools (DeepSeek Search/Fetch) are priced
-            # per CALL, not per token, so they get their own line rather than
-            # hiding inside a $/token figure. On a local backend this is the
-            # only real spend, so it shows there too.
-            tool_calls = p.total_search_requests + p.total_fetch_requests
-            if tool_calls > 0:
-                tool_bits = []
-                if p.total_search_requests:
-                    tool_bits.append(f"{p.total_search_requests:,} search")
-                if p.total_fetch_requests:
-                    tool_bits.append(f"{p.total_fetch_requests:,} fetch")
-                cost_str += (
-                    f" (incl. ${p.get_tool_request_cost():.4f} for "
-                    f"{' + '.join(tool_bits)} tool calls)"
-                )
-            lines.append(
-                f"  **{p.name}**: {p.total_requests} requests, "
-                f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
-                f"{cost_str}"
-            )
-            if storage_est > 0:
-                live_note = (
-                    f", ${gemini_live_storage:.4f} still accruing on a live cache"
-                    if p.name == "Gemini" and gemini_live_storage > 0 else ""
-                )
-                lines.append(
-                    f"      ⏳ + ~${storage_est:.4f} Gemini cache storage "
-                    f"(time-based, per token-hour{live_note})"
-                )
-            if energy_wh > 0:
-                grid = p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None else GRID_GCO2_PER_KWH
-                lines.append(
-                    f"      🌱 ≈ {energy_wh:.1f} Wh ≈ {co2_g:.0f} g CO₂e "
-                    f"(grid ≈ {grid:.0f} g/kWh)"
-                )
+        grand_total = sum(r["cost"] for r in rows)
+        storage_total = sum(r["storage"] for r in rows)
+        energy_wh_total = sum(r["energy"] for r in rows)
+        co2_g_total = sum(r["co2"] for r in rows)
+        train_co2_g_total = sum(r["train"] for r in rows)
 
         # energy_wh_total guards the local/self-hosted case: those bill $0 per
         # token but still record tokens, so a non-zero energy total means real
         # traffic happened even when grand_total is $0.
         if grand_total == 0 and storage_total == 0 and energy_wh_total == 0:
-            return "💰 No API calls made yet."
+            return "\U0001F4B0 No API calls made yet."
+
+        def money(v):
+            """2dp in the rankings so they stay scannable; the detail block
+            below carries full precision for anything this rounds away."""
+            if v >= 0.01:
+                return "${:,.2f}".format(v)
+            return "<$0.01" if v > 0 else "$0.00"
+
+        def mass(g):
+            if g >= 1000:
+                return "{:,.1f} kg".format(g / 1000)
+            # "0 g" reads as "none"; "<1 g" reads as "negligible", which is
+            # what a sub-gram figure actually means.
+            return "{:,.0f} g".format(g) if g >= 0.5 else "<1 g"
+
+        def share(part, whole):
+            if not whole:
+                return "  - "
+            pct = part / whole * 100
+            return "<1%" if 0 < pct < 0.5 else "{:.0f}%".format(pct)
+
+        spend_total = grand_total + storage_total
+        by_cost = sorted(rows, key=lambda r: r["cost"] + r["storage"],
+                         reverse=True)
+        by_co2 = sorted(rows, key=lambda r: r["co2"], reverse=True)
+
+        lines = ["\U0001F4B0 **Cost Summary**", "```"]
+        lines.append("{:<26}{}".format("by cost", "by CO2e"))
+        for i in range(len(rows)):
+            c, e = by_cost[i], by_co2[i]
+            c_v = c["cost"] + c["storage"]
+            left = "{} {:<9}{:>9}{:>5}".format(
+                i + 1, c["p"].name, money(c_v), share(c_v, spend_total))
+            right = "{} {:<9}{:>9}{:>5}".format(
+                i + 1, e["p"].name, mass(e["co2"]), share(e["co2"], co2_g_total))
+            lines.append("{:<26}{}".format(left, right))
+        lines.append("```")
 
         if storage_total > 0:
             lines.append(
-                f"\n  **Total**: ${grand_total:.4f} tokens "
-                f"+ ~${storage_total:.4f} cache storage (est) "
-                f"= **~${grand_total + storage_total:.4f}**"
-            )
+                "**Total**: ${:.4f} tokens + ~${:.4f} cache storage (est) "
+                "= **~${:.4f}**".format(grand_total, storage_total, spend_total))
         else:
-            lines.append(f"\n  **Total**: ${grand_total:.4f}")
+            lines.append("**Total**: ${:.4f}".format(grand_total))
+
         # Prepaid-plan fees are flat monthly commitments, not usage, so they sit
         # BELOW the usage total rather than inside it — the total has to stay a
         # figure that only moves when the bot actually spends.
-        plan_fees = sum(
-            p.plan_monthly_usd for p in providers
-            if p.cost_mode == "plan" and p.plan_monthly_usd
-        )
-        if plan_fees > 0:
-            plan_names = ", ".join(
-                p.name for p in providers
-                if p.cost_mode == "plan" and p.plan_monthly_usd
-            )
+        plan_rows = [r for r in rows
+                     if r["p"].cost_mode == "plan" and r["p"].plan_monthly_usd]
+        if plan_rows:
+            fees = sum(r["p"].plan_monthly_usd for r in plan_rows)
+            names = ", ".join(r["p"].name for r in plan_rows)
             lines.append(
-                f"  **+ prepaid plans**: ${plan_fees:.2f}/mo flat ({plan_names}) — "
-                f"owed whether or not a token is sent, so it is not in the usage "
-                f"total above. Token counts and 🌱 below are unaffected."
-            )
+                "**+ prepaid plans**: ${:.2f}/mo flat ({}) — owed whether or "
+                "not a token is sent, so it is not in the usage total "
+                "above.".format(fees, names))
+
         if energy_wh_total > 0:
+            equiv = _co2_equivalents(co2_g_total)
             lines.append(
-                f"  **Energy (est)**: ≈ {energy_wh_total:.1f} Wh ≈ {co2_g_total:.0f} g CO₂e — "
-                f"order-of-magnitude only; per-provider grid intensity, non-reasoning baseline "
-                f"(tune Wh/grid in code/.env)."
-            )
+                "\U0001F331 **~ {:,.1f} kWh ~ {} CO2e**".format(
+                    energy_wh_total / 1000.0, mass(co2_g_total))
+                + (" — {}.".format(equiv) if equiv else ""))
+            lines.append(
+                "   _Order-of-magnitude only: per-provider grid intensity, "
+                "non-reasoning baseline, tailpipe-only car figure. Tune "
+                "Wh/grid in code/.env._")
         if AMORTIZE_TRAINING and train_co2_g_total > 0:
+            t_equiv = _co2_equivalents(train_co2_g_total)
+            short = ""
+            if t_equiv:
+                short = " (" + t_equiv.split(", or")[0].replace(
+                    "about the same as driving ", "") + ")"
             lines.append(
-                f"  **+ amortized training (rough)**: ≈ {train_co2_g_total:.0f} g CO₂e — "
-                f"embodied training carbon over a ~{MODEL_LIFETIME_TOKENS / 1e12:.0f}T-token "
-                f"lifespan (squishiest estimate here; AMORTIZE_TRAINING=0 to hide)."
-            )
+                "   **+ amortized training**: ~ {} CO2e{} over a ~{:.0f}T-token "
+                "lifespan — squishiest estimate here; AMORTIZE_TRAINING=0 to "
+                "hide.".format(mass(train_co2_g_total), short,
+                               MODEL_LIFETIME_TOKENS / 1e12))
+
+        lines.append("**Detail**")
+        for r in by_cost:
+            p = r["p"]
+            total_in = r["in"] + r["cached"]
+            hit = (r["cached"] / total_in * 100) if total_in else 0.0
+            cache_note = (", \U0001F7E2 {:,} cached ({:.0f}% hit)".format(
+                r["cached"], hit) if r["cached"] else "")
+            # Self-hosted / local backends bill electricity, not per token —
+            # show that instead of a $0.0000 that reads like "free". The
+            # energy figures still report (tokens are counted) on the
+            # self-host grid.
+            if p.cost_mode == "local":
+                cost_str = "local (no per-token $ — electricity only)"
+            elif p.cost_mode == "plan":
+                fee = (" — ${:.2f}/mo flat".format(p.plan_monthly_usd)
+                       if p.plan_monthly_usd else "")
+                cost_str = "prepaid plan (no per-token ${})".format(fee)
+            else:
+                cost_str = "${:.4f}".format(r["cost"])
+            if p.cost_mode != "local" and p.total_peak_surcharge > 0:
+                cost_str += " (incl. ${:.4f} peak-hour surcharge)".format(
+                    p.total_peak_surcharge)
+            # Per-request server-side tools (DeepSeek Search/Fetch) are priced
+            # per CALL, not per token, so they are called out rather than
+            # hiding inside a $/token figure.
+            tool_calls = p.total_search_requests + p.total_fetch_requests
+            if tool_calls > 0:
+                bits = []
+                if p.total_search_requests:
+                    bits.append("{:,} search".format(p.total_search_requests))
+                if p.total_fetch_requests:
+                    bits.append("{:,} fetch".format(p.total_fetch_requests))
+                cost_str += " (incl. ${:.4f} for {} tool calls)".format(
+                    p.get_tool_request_cost(), " + ".join(bits))
+            grid = (p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
+                    else GRID_GCO2_PER_KWH)
+            lines.append(
+                "  **{}**: {} requests, {:,} in + {:,} out{} = {} "
+                "\u00b7 {:.1f} Wh, {:.0f} g CO2e (grid ~ {:.0f})".format(
+                    p.name, p.total_requests, r["in"], r["out"], cache_note,
+                    cost_str, r["energy"], r["co2"], grid))
+            if r["storage"] > 0:
+                live = (", ${:.4f} still accruing on a live cache".format(
+                    gemini_live_storage)
+                    if p.name == "Gemini" and gemini_live_storage > 0 else "")
+                lines.append(
+                    "      \u23F3 + ~${:.4f} Gemini cache storage "
+                    "(time-based, per token-hour{})".format(r["storage"], live))
         return "\n".join(lines)
-    
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Save all memories to disk (synchronous - use save_memories_async in async contexts)."""
         data = {

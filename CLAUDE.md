@@ -147,6 +147,30 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ `!cost` rewritten: ranked by cost AND carbon, with everyday equivalents (2026-11-07)
+The old layout listed providers in **registry order**, three lines each, which buried the one
+genuinely surprising thing in the data: **cost and carbon rank differently.** On real figures Claude
+is 59% of spend but 15% of emissions, while DeepSeek is 3% of spend and **83% of emissions** — cheap
+head, dirty grid, far more tokens. A registry-ordered list hid that completely.
+- **Two rankings side by side** in a fenced block (so Discord preserves the alignment), then the
+  total, then the carbon line, then a per-provider **Detail** section. Insight first, precision after.
+  Nothing from the old format was dropped: token counts, cache hit rates, Gemini cache storage, the
+  `local` electricity-only label, the prepaid-plan footer, peak surcharge and per-request tool spend
+  all survive in Detail, and the harness pins each of them.
+- **Everyday carbon equivalents** on the total, because "7,199 g CO₂e" means nothing to most people:
+  `_co2_equivalents()` renders km in an average petrol car (`CO2_G_PER_KM_PETROL_CAR`, 250 g/km from
+  the EPA's ~400 g/mile — **tailpipe only**, so it understates driving and is the conservative
+  direction for a comparison that flatters us) and hours of PC gaming on a coal grid
+  (`GAMING_PC_WATTS` 400 W × `COAL_GRID_GCO2_PER_KWH` 820, the IPCC AR5 lifecycle median for coal).
+  Two anchors deliberately, not five — a longer list reads as precision the estimate doesn't have.
+  All three are `.env`-overridable.
+- Formatting judgements worth keeping: rankings use 2dp (`<$0.01` below that) so they stay scannable
+  while Detail keeps 4dp; a sub-1% share renders `<1%` and a sub-gram mass `<1 g`, because `0%` and
+  `0 g` read as *nothing* rather than *negligible*.
+- Offline-validated: `scratchpad/test_cost_summary_format.py` (23/23 — the rankings really do come
+  out in different orders, the equivalents appear and degrade to minutes/metres for small masses,
+  every old field survives, and all seven heads render in **1,743 chars** against Discord's 2,000).
+
 ### ✅ web_search tool upgraded to the current variant (2026-11-07)
 All three Claude `web_search` sites (`_generate_claude_response`'s default + both `_web_search` creates)
 moved `web_search_20250305` → **`web_search_20260209`**, the current variant with dynamic filtering.
