@@ -297,9 +297,24 @@ block (always first) and false for everything downstream of the thread index.
   cross-turn stability invariant driven through the real `_generate_response`, tail delivery, the
   non-user-turn fallback, and all four Claude `cache_system`×reading-material combinations). Syntax +
   import gates pass; all 9 pre-existing harnesses still green (22/28/31/38/33/15/16 + 2 OK).
-  ⚠️ Owes a live smoke test: one `!claude` and one `!deepseek` turn in a channel with a live thread,
-  confirming `!cost` shows cache hits climbing across consecutive turns. Not yet mirrored to
-  isaic-slack-bot (`core.py` has the same `insert(0, ...)` shape — same bug, same fix).
+- ✅ **LIVE-VERIFIED 2026-11-07** via `scratchpad/live_cache_smoke.py` (3 real Opus 5.5 calls, $0.091;
+  needs only `ANTHROPIC_API_KEY` — the cache claim is an API fact, not a Discord one, so this needs no
+  running bot). Hydra's real cached prefix is **8,838 tokens** — far larger than grayson-bot's 4,416,
+  because our system prompt carries seven personas, server context and the plurality block on top of
+  the `web_search` definition.
+  ```
+  1. cold call                                read      0   uncached 8,912
+  2. warm — thread age AND memory both changed read  8,760   uncached   157
+  3. control: volatile back in the system prompt (the OLD shape)
+                                              read      0   uncached 8,891
+  ```
+  Call 2 is the claim: the tail churned on every axis it has and the prefix still read back whole.
+  Call 3 reproduces the pre-fix behavior deliberately and reads nothing, which is what EVERY turn did.
+  **Measured saving:** the prefix went from 8,891 × $4/M = **$0.0356/turn** to 8,760 × $0.20/M + 157 ×
+  $4/M = **$0.0024/turn**, i.e. **−93% of the prefix**; a 10-turn warm burst goes $0.356 → $0.066
+  (**−82%**) including the one-off $0.044 write. Mirrored to isaic-slack-bot (same fix, its own smoke
+  test still owed since it has no live `config.json`). ⚠️ Still unexercised: only the Discord wiring —
+  `!cost` after two real channel turns.
 
 ### ✅ Provider-email sweep: dead Fireworks slugs, DeepSeek → V4.1 Flash + peak pricing, Qwen → Alibaba (2026-09-21)
 Triggered by unread provider emails (Fireworks serverless deprecations 08-27 / 09-04 / 09-25,
