@@ -336,10 +336,29 @@ class ModelProvider:
     backends: dict = field(default_factory=dict)
     # Backend characteristics (Phase 3). supports_server_cache=False for a
     # self-hosted endpoint (no prompt cache → cached price = input price).
-    # cost_mode="local" skips per-token $ and labels the turn electricity-only
-    # (tokens are still counted, so energy/CO₂ still report).
+    #
+    # cost_mode decides how DOLLARS are attributed. It never touches the
+    # token counters, and 🌱 energy/CO₂ are computed from those counters alone
+    # (get_energy_wh / get_co2_g ignore cost_mode entirely) — so carbon
+    # accounting stays exact under every mode. That is the whole trick that
+    # makes a prepaid plan safe to model.
+    #   "metered" — pay per token at the rates above (every head today).
+    #   "local"   — self-hosted: no per-token $, labelled electricity-only.
+    #   "plan"    — a prepaid subscription (e.g. Alibaba Model Studio's Token
+    #               Plan, $3–5/mo of Credits). Usage draws down an allowance
+    #               bought up front, so a per-token $ figure would double-count
+    #               against the flat fee; tokens, energy and CO₂ still report
+    #               exactly. plan_monthly_usd carries the fee for the !cost
+    #               footer. We deliberately do NOT invent a credits counter:
+    #               the OpenAI-compatible endpoint returns tokens, not credits,
+    #               and the token→credit ratio is Alibaba's to define, so a
+    #               local guess would be fiction.
     supports_server_cache: bool = True
-    cost_mode: str = "metered"           # "metered" | "local"
+    cost_mode: str = "metered"           # "metered" | "local" | "plan"
+    # Flat monthly fee for cost_mode="plan"; surfaced as its own !cost line
+    # rather than folded into usage, because it is owed whether or not a single
+    # token is sent.
+    plan_monthly_usd: float = 0.0
     # Routing metadata target (spec §4.1). INERT this phase — routing stays in
     # _estimate_confidence; never consulted by _select_model yet. Groundwork
     # for a future config-driven router.
@@ -411,6 +430,20 @@ class ModelProvider:
     peak_windows_utc: tuple = ()
     peak_multiplier: float = 1.0
 
+    # Server-side tool pricing, billed PER REQUEST rather than per token.
+    # DeepSeek's Search & Fetch APIs (/v1/tools/search, /v1/tools/fetch) bill
+    # $0.75 per 1,000 SUCCESSFUL requests each, metered separately, from
+    # 2026-10-31 16:00 UTC. A request counts only on HTTP 200 with a result (a
+    # non-empty `results` array for search, page content for fetch) — failures,
+    # empty results and timeouts are free — and `count` does not change the
+    # per-request price. These are flat: no peak multiplier applies.
+    # 0.0 (the default) means the provider has no such billing, so every other
+    # head is unaffected. Metered via record_tool_requests, NOT record_usage,
+    # because they are request-priced and must stay out of the token buckets
+    # and the energy/CO₂ estimate (which is per token).
+    search_cost_per_1k_requests: float = 0.0
+    fetch_cost_per_1k_requests: float = 0.0
+
     # Provider quirks for the OpenAI-compatible generator
     # ---------------------------------------------------
     # requires_reasoning_echo: When thinking mode is on, the provider's API
@@ -422,13 +455,21 @@ class ModelProvider:
     #   Deepseek V4 has this; Gemini does not.
     requires_reasoning_echo: bool = False
     disables_thinking_by_default: bool = False
-    # think_reasoning_effort: value sent as the OpenAI-standard
-    #   `reasoning_effort` param when thinking mode is requested. Kimi K3
-    #   accepts ONLY "max" here, and the K2-era extra_body {"thinking": ...}
-    #   param must NOT be sent to it (per Moonshot's K3 docs) — its reasoning
-    #   is internal, no reasoning_content echo. None (default) → the shim
-    #   never sends reasoning_effort.
+    # think_reasoning_effort / plain_reasoning_effort: values sent as the
+    #   OpenAI-standard `reasoning_effort` param on a thinking turn and on a
+    #   plain turn respectively. The K2-era extra_body {"thinking": ...} param
+    #   must NOT be sent to Kimi K3 (it rejects it) — its reasoning is
+    #   internal, no reasoning_content echo. None → the shim sends nothing for
+    #   that tier.
+    #   ⚠️ Correction (2026-11-07, Moonshot docs): K3 does NOT accept only
+    #   "max". The whole K3 series ALWAYS thinks and takes top-level
+    #   `reasoning_effort` of "low" | "high" | "max", **defaulting to "max"**.
+    #   That default is why plain_reasoning_effort exists: sending nothing on a
+    #   plain turn is not "thinking off", it is "thinking at MAX", silently, on
+    #   the most expensive open head. Mirrors the Claude plain/thinking effort
+    #   tiers (CLAUDE_PLAIN_EFFORT vs CLAUDE_THINKING_EFFORT).
     think_reasoning_effort: Optional[str] = None
+    plain_reasoning_effort: Optional[str] = None
 
     # Which SearchBackend to use when this provider needs to ground via the web.
     # Values: "tavily", "google_native", or None (no external search). Claude has
@@ -489,6 +530,13 @@ class ModelProvider:
     # This prevents a model upgrade from repricing lifetime token history.
     total_token_cost: Optional[float] = None
 
+    # Server-side tool requests (DeepSeek Search & Fetch), counted for display
+    # and metered into dollars AT RECORD TIME — same discipline as
+    # total_token_cost, so a later rate change never reprices history.
+    total_search_requests: int = 0
+    total_fetch_requests: int = 0
+    total_tool_request_cost: float = 0.0
+
     def is_peak(self, when: Optional[datetime] = None) -> bool:
         """True if `when` (default: now) falls in one of this provider's
         peak-pricing windows. Ignores public holidays (DeepSeek exempts
@@ -548,21 +596,66 @@ class ModelProvider:
                 (self._token_cost() - base_before) * (self.peak_multiplier - 1.0)
             )
 
+    def record_tool_requests(self, search: int = 0, fetch: int = 0) -> None:
+        """Record SUCCESSFUL server-side tool requests (DeepSeek Search/Fetch).
+
+        Separate from record_usage because these are priced per REQUEST, not
+        per token: they must not enter the token buckets (which would corrupt
+        $/token math) nor the energy estimate (which is per token). Pass only
+        requests that actually billed — HTTP 200 with a result. Dollars are
+        metered here, at the rates in force now, so a later price change never
+        reprices history.
+
+        Nothing calls this yet: `!search` and the panel run on Tavily, and the
+        bot never hits /v1/tools/search or /v1/tools/fetch. It exists so that
+        enabling DeepSeek's native search is a two-line change that CANNOT
+        silently under-report in !cost — the same failure the 2026-09 cache-hit
+        gap had, where real spend simply wasn't counted.
+        """
+        if search:
+            self.total_search_requests += search
+            self.total_tool_request_cost += (
+                search / 1000.0 * self.search_cost_per_1k_requests
+            )
+        if fetch:
+            self.total_fetch_requests += fetch
+            self.total_tool_request_cost += (
+                fetch / 1000.0 * self.fetch_cost_per_1k_requests
+            )
+
+    def get_tool_request_cost(self) -> float:
+        """Dollars billed for per-request server-side tools.
+
+        NOT exempted by cost_mode="local": a self-hosted backend pays nothing
+        for inference, but Search/Fetch is a hosted DeepSeek service billed to
+        the account whatever runs the model. Zero unless such requests were
+        actually recorded, so a local provider still reports $0 overall.
+        """
+        return self.total_tool_request_cost
+
     def get_cost(self) -> float:
-        """Get total cost for this provider across all pricing tiers and cache
-        states, including any peak-hour surcharge."""
-        if self.cost_mode == "local":
-            return 0.0
+        """Usage dollars for this provider: tiers + cache states + peak-hour
+        surcharge + per-request tool spend.
+
+        Excludes a cost_mode="plan" flat fee on purpose — that is owed monthly
+        regardless of usage, so adding it here would make a fleet total that
+        grows with traffic when it doesn't. See plan_monthly_usd."""
+        if self.cost_mode in ("local", "plan"):
+            # Per-token $ doesn't apply: a self-host bills electricity, a plan
+            # bills a prepaid allowance. Hosted per-request tools still bill in
+            # both cases — see get_tool_request_cost.
+            return self.get_tool_request_cost()
         token_cost = self._token_cost() if self.total_token_cost is None else self.total_token_cost
-        return token_cost + self.total_peak_surcharge
+        return token_cost + self.total_peak_surcharge + self.get_tool_request_cost()
 
     def _token_cost(self) -> float:
         """Recorded tokens priced at the base (off-peak) rates."""
-        # Local / self-hosted backends bill electricity, not per token, so there
-        # is no $ figure to report. Tokens are still counted, so get_energy_wh /
-        # get_co2_g still surface the carbon. See cost_mode + the "local" label
-        # in ConversationManager.get_cost_summary.
-        if self.cost_mode == "local":
+        # Local / self-hosted backends bill electricity, and a "plan" backend
+        # bills a prepaid allowance, so neither has a per-token $ figure.
+        # Tokens are still counted either way, so get_energy_wh / get_co2_g
+        # still surface the carbon at full accuracy. See cost_mode + the
+        # "local" / "plan" labels in ConversationManager.get_cost_summary.
+        if self.cost_mode in ("local", "plan"):
             return 0.0
         input_cost = (self.total_input_tokens / 1_000_000) * self.input_cost_per_million
         output_cost = (self.total_output_tokens / 1_000_000) * self.output_cost_per_million
@@ -639,6 +732,9 @@ class ModelProvider:
             "cache_storage_cost_est": self.total_cache_storage_cost_est,
             "peak_surcharge": self.total_peak_surcharge,
             "token_cost": self._token_cost() if self.total_token_cost is None else self.total_token_cost,
+            "search_requests": self.total_search_requests,
+            "fetch_requests": self.total_fetch_requests,
+            "tool_request_cost": self.total_tool_request_cost,
         }
 
     def load_stats(self, data: dict) -> None:
@@ -651,6 +747,10 @@ class ModelProvider:
         self.total_requests = data.get("requests", 0)
         self.total_cache_storage_cost_est = data.get("cache_storage_cost_est", 0.0)
         self.total_peak_surcharge = data.get("peak_surcharge", 0.0)
+        # Older saves predate per-request tool billing; 0 is the right history.
+        self.total_search_requests = data.get("search_requests", 0)
+        self.total_fetch_requests = data.get("fetch_requests", 0)
+        self.total_tool_request_cost = data.get("tool_request_cost", 0.0)
         self.total_token_cost = data.get("token_cost")
         if self.total_token_cost is None:
             if self.id == "claude":
@@ -758,10 +858,31 @@ DEEPSEEK_PROVIDER = ModelProvider(
     # US Eastern: Sun–Thu 9pm–midnight + weekday 2–6am.
     peak_windows_utc=(((0, 1, 2, 3, 4), 1, 4), ((0, 1, 2, 3, 4), 6, 10)),
     peak_multiplier=2.0,
+    # Search & Fetch server-side tools: $0.75 per 1,000 successful requests
+    # EACH, metered separately, live since 2026-10-31 16:00 UTC. Flat — the
+    # peak multiplier does not apply. We don't call them (search runs on
+    # Tavily), so these only matter if that changes; the rates are here so
+    # record_tool_requests prices them correctly on day one. Verified against
+    # api-docs.deepseek.com/guides/search, 2026-11-07.
+    search_cost_per_1k_requests=0.75,
+    fetch_cost_per_1k_requests=0.75,
     # 1M context per DeepSeek docs (max output 384k). Server-side
     # context caching is automatic — no client flags required.
     max_context_tokens=1_000_000,
-    supports_vision=False,
+    # NATIVE MULTIMODAL since 2026-09-10, enabled 2026-11-07 (Sarah's call).
+    # api-docs.deepseek.com/guides/vision: `deepseek-flash` takes images as
+    # base64 data URL, http(s) URL or Files API id; JPEG/PNG/GIF/WebP; an upper
+    # bound of 1024 tokens per image; ≤600 images and a 48 MiB body per
+    # request; images allowed ONLY in user messages (a system/assistant image
+    # returns 400 — we only ever attach to user turns, so that holds).
+    # Wire format is already handled: _convert_messages_to_openai_format turns
+    # our Anthropic-style {"type":"image","source":{...}} blocks into OpenAI
+    # {"type":"image_url"} data URLs for every shim provider.
+    # ROUTING EFFECT (the point of the flip): `vision_pool` in _select_model
+    # now includes Melchior, so an image message is no longer forced to
+    # Claude/Gemini — at $0.15/M vs $4/M that is the cheap eye. The 1024-token
+    # cap per image also makes it cheap to look.
+    supports_vision=True,
     supports_web_search=False,
     # Deepseek V4 enables thinking by default and requires reasoning_content
     # to be echoed back on every prior assistant turn when thinking is on.
@@ -1008,31 +1129,52 @@ KIMI_PROVIDER = ModelProvider(
     api_key_env="MOONSHOT_API_KEY",
     base_url="https://api.moonshot.ai/v1",
     backend="api",
-    # Kimi K3 (Moonshot AI, released 2026-07-16): 2.8T-param sparse MoE
-    # (16 of 896 experts ≈ ~50B active), Kimi Delta Attention (hybrid linear —
-    # ~6.3× faster decode at 1M ctx), 1M context. Largest open-weights model to
-    # date (weights due 2026-07-27). This is the PREMIUM open head, not a cheap
-    # one — $3/$15 puts it above Claude on input. Override-only in routing.
-    model_id="kimi-k3",
-    input_cost_per_million=3.00,         # platform.kimi.ai — reconfirmed 2026-08-02
-    output_cost_per_million=15.00,
+    # Kimi K3.1 Pro (Moonshot AI, launched 2026-10-23) — Moonshot's flagship,
+    # successor to K3 (2026-07-16: 2.8T sparse MoE, 16 of 896 experts ≈ ~50B
+    # active, Kimi Delta Attention, largest open-weights model of its day).
+    # Moved K3 → K3.1 Pro on 2026-11-07: it is BOTH better and CHEAPER, which
+    # is rare — $2/$10 against K3's $3/$15, and a lower cache rate too. Still
+    # the premium OPEN head and still override-only in routing (at $2/M input
+    # it is now under Claude but far over Qwen/DeepSeek, so the argmax penalty
+    # stays cost-safety). `kimi-k3` is NOT deprecated if we ever want it back;
+    # `kimi-k3.1-pro-highspeed` is the same intelligence at ~2–3× the speed for
+    # exactly 2× the price ($4/$20), which is not a trade this bot needs.
+    model_id="kimi-k3.1-pro",
+    # Prices read off platform.kimi.ai/docs/pricing/chat on 2026-11-07. The
+    # table renders client-side, so a plain fetch returns an empty <table> —
+    # read it in a browser, don't trust aggregators (they quote blended or
+    # reseller rates).
+    input_cost_per_million=2.00,
+    output_cost_per_million=10.00,
     # Automatic server-side prefix caching (DeepSeek-style, no client flags);
-    # cache hits bill at $0.30/M. The shim reads standard usage fields — if
-    # Moonshot reports hits under a nonstandard key, hits will undercount
-    # (bill as full-price input) until we map it. VERIFY on first live !cost.
-    cached_input_cost_per_million=0.30,
-    max_context_tokens=1_000_000,
+    # cache hits bill at $0.20/M. Confirmed 2026-11-07 that Moonshot reports
+    # hits in the OpenAI-standard `prompt_tokens_details.cached_tokens`, which
+    # _usage_cache_hits already reads — so the old "nonstandard key" worry is
+    # resolved and hits are priced correctly.
+    cached_input_cost_per_million=0.20,
+    # ⚠️ KNOWN GAP: the K3 series bills cache WRITES separately by TTL
+    # ($2.00/MTok at the 5m default, $4.00/MTok at 1h) on top of reads. We model
+    # read rates only, so !cost under-reports a cold bookclub prefix on Kimi.
+    # Also unmodelled: batch inference at 60% (we never batch).
+    max_context_tokens=1_048_576,        # exactly 1,048,576 for all K3 series
     # K3 is multimodal upstream, but vision stays OFF like the other open
     # heads — Claude/Gemini are the designated eyes (deliberate, not a gap).
     supports_vision=False,
     supports_web_search=False,
     search_backend="tavily",
-    # K3 thinking quirk: reasoning is requested via the OpenAI-standard
-    # reasoning_effort param — "max" is the ONLY value K3 accepts — and the
-    # K2.x extra_body {"thinking": ...} shape must NOT be sent (K3 rejects
-    # it). No reasoning_content echo requirement. ⚠️ VERIFY on first live
-    # !think !kimi turn.
+    # K3 thinking: reasoning rides the OpenAI-standard reasoning_effort param;
+    # the K2.x extra_body {"thinking": ...} shape must NOT be sent (K3 rejects
+    # it), and there is no reasoning_content echo requirement.
+    # Re-read against Moonshot's docs 2026-11-07: "The Kimi K3 series always
+    # enables thinking ... and uses the top-level `reasoning_effort` field
+    # (`low`, `high`, or `max`; default `max`)." So K3 accepts all three, and
+    # the earlier "max is the only accepted value" note here was WRONG.
+    # Consequence: sending nothing on a plain turn billed every `!kimi` chat
+    # turn at MAX reasoning on our priciest open head. Plain turns now ask for
+    # "low" explicitly — thinking can't be switched off at all on K3, so "low"
+    # is the floor, not "off".
     think_reasoning_effort="max",
+    plain_reasoning_effort="low",
     est_wh_per_1k_tokens=0.5,   # VERIFY — huge total params but sparse (~50B active) + KDA decode wins
     grid_gco2_per_kwh=550.0,    # Moonshot China API (east-CN grid, same basis as DeepSeek api)
     train_tco2e=4000.0,         # estimate — biggest open train to date, but ~2.5× K2 scaling efficiency; CN grid
@@ -1048,12 +1190,37 @@ KIMI_PROVIDER = ModelProvider(
         "fireworks": {
             "base_url": "https://api.fireworks.ai/inference/v1",
             "api_key_env": "FIREWORKS_API_KEY",
+            # ⚠️ STILL K3, NOT K3.1 Pro. As of 2026-11-07 Fireworks serves only
+            # `kimi-k3` (plus kimi-k3-fast / kimi-k3-us routers) — there is no
+            # published serverless `kimi-k3.1-pro`. So this backend is a
+            # DIFFERENT, older, dearer model than the default spec above, and
+            # its own pricing below is correct for what it serves.
+            # Consequence: while the live config.json keeps
+            # providers.kimi.backend="fireworks", the K3.1 Pro upgrade is
+            # INERT. Getting it live means dropping that override and setting
+            # MOONSHOT_API_KEY — which moves Kaworu's egress back to the
+            # China-resident API and adds a second bill, the exact trade that
+            # sent it to Fireworks in the first place. Operator's call.
             "model": "accounts/fireworks/models/kimi-k3",    # verified live 2026-08-02
             "input_cost_per_million": 3.00,
             "output_cost_per_million": 15.00,
             "cached_input_cost_per_million": 0.30,           # 0.1× — Fireworks matches Moonshot's cache rate
+            "max_context_tokens": 1_040_000,                 # Fireworks lists 1040k for its K3
             "grid_gco2_per_kwh": 400.0,                      # Fireworks US fleet
             "supports_server_cache": True,
+            # ⚠️ Both reasoning tiers are cleared here ON PURPOSE. The
+            # "always thinks, defaults to max" behavior is documented for
+            # MOONSHOT's hosted K3; Fireworks serves the open weights and may
+            # not implement `reasoning_effort` at all, and a param it rejects
+            # fails the entire turn. Since the live config.json overrides Kimi
+            # onto this backend, guessing here would risk breaking plain
+            # `!kimi` outright to chase a cost saving.
+            # To enable: send one `!kimi` and one `!think !kimi` against
+            # Fireworks; if `reasoning_effort` is accepted, set
+            # "plain_reasoning_effort": "low" and
+            # "think_reasoning_effort": "max" here.
+            "think_reasoning_effort": None,
+            "plain_reasoning_effort": None,
         },
     },
 )
@@ -1320,10 +1487,29 @@ _BACKEND_FIELD_MAP = {
     "grid_gco2_per_kwh": "grid_gco2_per_kwh",
     "supports_server_cache": "supports_server_cache",
     "cost_mode": "cost_mode",
+    "plan_monthly_usd": "plan_monthly_usd",
     "peak_windows_utc": "peak_windows_utc",  # () = flat-priced backend
     "max_context_tokens": "max_context_tokens",
     "est_wh_per_1k_tokens": "est_wh_per_1k_tokens",
+    # Reasoning-effort tiers are per-BACKEND: the same open weights served
+    # elsewhere need not implement the vendor's reasoning_effort param at all,
+    # and sending one it rejects fails the whole turn. A backend sets these to
+    # None to send nothing until it has been smoke-tested.
+    "think_reasoning_effort": "think_reasoning_effort",
+    "plain_reasoning_effort": "plain_reasoning_effort",
 }
+
+# Backend-override keys where an explicit None is a REAL value, not "unset":
+# self_hosted has no api key; a None grid means "use the global fallback"; and a
+# None reasoning tier means "send no reasoning_effort on this backend". Every
+# other key skips None so a partial override dict can't blank a code default.
+# See ProviderRegistry._apply_backend.
+_BACKEND_NULLABLE_FIELDS = (
+    "api_key_env",
+    "grid_gco2_per_kwh",
+    "think_reasoning_effort",
+    "plain_reasoning_effort",
+)
 
 
 class ProviderRegistry:
@@ -1404,6 +1590,32 @@ class ProviderRegistry:
             prov.model_id = pcfg["model"]
         if "routing_tags" in pcfg:
             prov.routing_tags = list(pcfg["routing_tags"])
+        # Billing arrangement. The usual case is per-token ("metered"); set
+        # "plan" when this provider's usage is prepaid (Alibaba Model Studio's
+        # Token Plan: Credits bought monthly) so !cost stops reporting a
+        # per-token $ that would double-count against the flat fee. Token,
+        # energy and CO₂ accounting are untouched by this — that is the point.
+        # e.g. providers.qwen = {"cost_mode": "plan", "plan_monthly_usd": 3}
+        if "cost_mode" in pcfg:
+            mode = pcfg["cost_mode"]
+            if mode in ("metered", "local", "plan"):
+                prov.cost_mode = mode
+            else:
+                print(f"⚠️  {prov.name}: ignoring unknown cost_mode={mode!r} "
+                      f"(known: metered, local, plan) — keeping "
+                      f"{prov.cost_mode!r}.")
+        if "plan_monthly_usd" in pcfg:
+            try:
+                prov.plan_monthly_usd = float(pcfg["plan_monthly_usd"])
+            except (TypeError, ValueError):
+                print(f"⚠️  {prov.name}: plan_monthly_usd="
+                      f"{pcfg['plan_monthly_usd']!r} is not a number — "
+                      f"ignoring (the !cost plan line will omit the fee).")
+            else:
+                if prov.cost_mode != "plan":
+                    print(f"⚠️  {prov.name}: plan_monthly_usd is set but "
+                          f"cost_mode is {prov.cost_mode!r}, so the fee will "
+                          f"not show. Set cost_mode='plan' too.")
         # Simulator mode (Phase 7) + the endpoint knobs an operator needs to
         # point the Dummy Plug at their own /completions box. These are additive
         # and only fire when present in config, so the default config (and the 6
@@ -1473,10 +1685,14 @@ class ProviderRegistry:
             if okey not in overrides:
                 continue
             val = overrides[okey]
-            # api_key_env and grid_gco2_per_kwh are intentionally Nullable
-            # (self_hosted has no key; None grid → global fallback). Skip an
-            # explicit None elsewhere so a partial dict can't blank a default.
-            if val is None and okey not in ("api_key_env", "grid_gco2_per_kwh"):
+            # Some fields are intentionally Nullable, where None is a MEANINGFUL
+            # value rather than "unset": self_hosted has no key; a None grid
+            # falls back to the global figure; and a None reasoning tier means
+            # "send no reasoning_effort on this backend", which is how a backend
+            # serving the same open weights opts out of a vendor-specific param
+            # it may reject. Elsewhere an explicit None is skipped so a partial
+            # override dict can't blank a default.
+            if val is None and okey not in _BACKEND_NULLABLE_FIELDS:
                 continue
             setattr(prov, attr, val)
 
@@ -2555,10 +2771,34 @@ class ConversationManager:
             # Self-hosted / local backends bill electricity, not per token — show
             # that instead of a $0.0000 that reads like "free". The 🌱 energy
             # line below still reports (tokens are counted) on the self-host grid.
-            cost_str = ("local (no per-token $ — electricity only)"
-                        if p.cost_mode == "local" else f"${cost:.4f}")
+            if p.cost_mode == "local":
+                cost_str = "local (no per-token $ — electricity only)"
+            elif p.cost_mode == "plan":
+                # Prepaid allowance: tokens drew down Credits bought up front,
+                # so there is no per-token charge to report. The flat fee rides
+                # in its own footer line, and 🌱 below is unaffected.
+                fee = (f" — ${p.plan_monthly_usd:.2f}/mo flat"
+                       if p.plan_monthly_usd else "")
+                cost_str = f"prepaid plan (no per-token ${fee})"
+            else:
+                cost_str = f"${cost:.4f}"
             if p.cost_mode != "local" and p.total_peak_surcharge > 0:
                 cost_str += f" (incl. ${p.total_peak_surcharge:.4f} peak-hour surcharge)"
+            # Per-request server-side tools (DeepSeek Search/Fetch) are priced
+            # per CALL, not per token, so they get their own line rather than
+            # hiding inside a $/token figure. On a local backend this is the
+            # only real spend, so it shows there too.
+            tool_calls = p.total_search_requests + p.total_fetch_requests
+            if tool_calls > 0:
+                tool_bits = []
+                if p.total_search_requests:
+                    tool_bits.append(f"{p.total_search_requests:,} search")
+                if p.total_fetch_requests:
+                    tool_bits.append(f"{p.total_fetch_requests:,} fetch")
+                cost_str += (
+                    f" (incl. ${p.get_tool_request_cost():.4f} for "
+                    f"{' + '.join(tool_bits)} tool calls)"
+                )
             lines.append(
                 f"  **{p.name}**: {p.total_requests} requests, "
                 f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
@@ -2594,6 +2834,23 @@ class ConversationManager:
             )
         else:
             lines.append(f"\n  **Total**: ${grand_total:.4f}")
+        # Prepaid-plan fees are flat monthly commitments, not usage, so they sit
+        # BELOW the usage total rather than inside it — the total has to stay a
+        # figure that only moves when the bot actually spends.
+        plan_fees = sum(
+            p.plan_monthly_usd for p in providers
+            if p.cost_mode == "plan" and p.plan_monthly_usd
+        )
+        if plan_fees > 0:
+            plan_names = ", ".join(
+                p.name for p in providers
+                if p.cost_mode == "plan" and p.plan_monthly_usd
+            )
+            lines.append(
+                f"  **+ prepaid plans**: ${plan_fees:.2f}/mo flat ({plan_names}) — "
+                f"owed whether or not a token is sent, so it is not in the usage "
+                f"total above. Token counts and 🌱 below are unaffected."
+            )
         if energy_wh_total > 0:
             lines.append(
                 f"  **Energy (est)**: ≈ {energy_wh_total:.1f} Wh ≈ {co2_g_total:.0f} g CO₂e — "
@@ -5716,11 +5973,19 @@ Return one JSON object only:
                 extra_body["thinking"] = {"type": "disabled"}
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
-            if thinking and provider.think_reasoning_effort:
-                # Kimi K3 style: thinking is requested via the OpenAI-standard
-                # reasoning_effort param (K3 accepts only "max") — NOT the
-                # extra_body {"thinking": ...} shape, which K3 rejects.
-                api_kwargs["reasoning_effort"] = provider.think_reasoning_effort
+            # Kimi K3 style: reasoning depth rides the OpenAI-standard
+            # reasoning_effort param — NOT the extra_body {"thinking": ...}
+            # shape, which K3 rejects. Two tiers, because K3 ALWAYS thinks and
+            # defaults to "max": omitting the param on a plain turn does not
+            # mean "no thinking", it means "max thinking", which is why a plain
+            # tier is set explicitly. A provider/backend leaving either tier
+            # None sends nothing for it.
+            effort_tier = (
+                provider.think_reasoning_effort if thinking
+                else provider.plain_reasoning_effort
+            )
+            if effort_tier:
+                api_kwargs["reasoning_effort"] = effort_tier
             if tools:
                 api_kwargs["tools"] = tools
 
@@ -6601,7 +6866,11 @@ Return one JSON object only:
             return "I don't see any messages to respond to!", [], ""
 
         # If the latest user message contains URLs, fetch them via Tavily and
-        # append the extracted text in-place. Lets Deepseek (text-only) read
+        # append the extracted text in-place. Originally for Deepseek, which
+        # was text-only (it has had vision since 2026-09-10); still useful as a
+        # deterministic, model-independent copy of a linked page — Claude could
+        # web_search for it, but then every head sees different text. Lets a
+        # provider read
         # links and gives Claude a deterministic copy alongside its web_search.
         await self._augment_with_url_extracts(messages)
 

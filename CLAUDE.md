@@ -99,8 +99,23 @@ self-contained — you don't need it to pick up the remaining work below.
   ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
   Alibaba `qwen3.8-flash` (live on `dashscope-us` 2026-09-21), Fireworks `glm-5p3` + the `qwen3p8-max` /
   `deepseek-v4p1-flash` backend toggles (under `accounts/fireworks/models/`). 2026-08-02: Claude
-  `claude-opus-5`, Gemini `gemini-3.1-pro-preview` (still no stable 3.1-pro), Moonshot
-  `kimi-k3`. Mistral on its own API uses `mistral-large-latest` (→ Mistral Large 3, released
+  `claude-opus-5`. **Re-verified against official docs 2026-11-07:** `deepseek-flash` is still the
+  right slug but has silently been served by the **`DeepSeek-V4.1-Flash-1017`** snapshot since
+  2026-10-17 (pricing unchanged; the "Flash refreshes behind the same slug" precedent held again) —
+  552B MoE / 8B active in / 16B active out is confirmed verbatim, so our `est_wh` comment is right,
+  and it has had **native vision since 2026-09-10** (see the `supports_vision=False` note on the
+  constant — left off deliberately, it's a routing decision). Gemini `gemini-3.1-pro-preview` is
+  **still preview with no retirement date**, so "no stable 3.1-pro" remains true — but the line has
+  moved two generations past us: the flagship is now **`gemini-4-argon`** (1M ctx, $2/$10 until
+  2026-11-30 then **$4/$20**, and ⚠️ **no explicit caching** — it would break the bookclub
+  `cachedContents` path), `gemini-3.8-flash` is the current Flash, and `gemini-2.5-*` auto-routes to
+  3.8/3.5-lite on 2026-12-01. Moonshot `kimi-k3` is still served and NOT deprecated, but
+  **`kimi-k3.1-pro`** and `kimi-k3.1-pro-highspeed` now exist (1M ctx; K2 series retires late Dec
+  2026). Our old note that "K3 takes only `reasoning_effort=max`" was **wrong** and is now corrected in
+  code: the whole K3 series always thinks and takes top-level `reasoning_effort` of
+  `low`|`high`|`max`, **default `max`**, so sending nothing on a plain turn billed max effort. Fixed
+  via the `plain_reasoning_effort` tier (see the 2026-11-07 status entry). Mistral on its own API uses
+  `mistral-large-latest` (→ Mistral Large 3, released
   2025-12, 675B/41B MoE, Apache-2.0; $0.50/$1.50 per Mtok reconfirmed 2026-08 — note Mistral's
   *frontier* is now Medium 3.5 / `mistral-medium-latest` at $1.50/$7.50, which the Large alias
   will never pick up; Large stays the deliberate cheap+green pick). ⚠️ Large 3 is
@@ -131,6 +146,106 @@ byte-for-byte the old behavior):
 ---
 
 ## Status — 2026-11-07
+
+### ✅ Kimi → K3.1 Pro, DeepSeek vision on, prepaid-plan cost mode (2026-11-07)
+- **Kimi moved `kimi-k3` → `kimi-k3.1-pro`** (Moonshot's flagship, launched 2026-10-23). Both better
+  AND cheaper, which is rare: **$2.00/$10.00 with $0.20 cached**, against K3's $3/$15/$0.30. Prices
+  read off `platform.kimi.ai/docs/pricing/chat` **in a browser** — the table renders client-side, so a
+  plain fetch returns an empty `<table>` and aggregators quote blended/reseller numbers. Context is
+  exactly 1,048,576 for all K3 series. Confirmed Moonshot reports cache hits in the OpenAI-standard
+  `prompt_tokens_details.cached_tokens`, so `_usage_cache_hits` already prices them right — the old
+  "nonstandard key" worry is closed. Still override-only in routing. `kimi-k3` is NOT deprecated.
+  ⚠️ **Inert on the live config**: `providers.kimi.backend="fireworks"` is set, and Fireworks serves
+  only `kimi-k3` (plus kimi-k3-fast / -us routers) — there is no serverless `kimi-k3.1-pro`. Getting
+  K3.1 Pro live means dropping that override and setting `MOONSHOT_API_KEY`, which moves Kaworu's
+  egress back to the China-resident API and adds a second bill. Operator's call; the backend dict
+  keeps its own correct K3 pricing meanwhile.
+  ⚠️ **Known gap:** the K3 series bills cache WRITES separately by TTL ($2.00/MTok at the 5m default,
+  $4.00/MTok at 1h) on top of reads. We model read rates only, so `!cost` under-reports a cold
+  bookclub prefix on Kimi. Batch inference at 60% is also unmodelled (we never batch).
+- **DeepSeek vision ENABLED** (`supports_vision=True`, Sarah's call). Native multimodal since
+  2026-09-10: base64 data URL / http(s) URL / Files API id, JPEG·PNG·GIF·WebP, an upper bound of
+  **1024 tokens per image**, ≤600 images and a 48 MiB body per request, images only in user messages.
+  No new wiring needed — `_convert_messages_to_openai_format` already turns our Anthropic-style image
+  blocks into OpenAI `image_url` data URLs for every shim provider. **Routing effect:** `vision_pool`
+  in `_select_model` now includes Melchior, so an image message is no longer forced to Claude/Gemini —
+  at $0.15/M vs $4/M that is the cheap eye, and the 1024-token image cap keeps looking cheap.
+- **New `cost_mode="plan"` for prepaid subscriptions.** Answers "can we just keep per-token energy/CO₂
+  for the monthly plans?" — yes, and it costs nothing in fidelity, because `get_energy_wh` /
+  `get_co2_g` are computed from the token counters alone and never consult `cost_mode`. So a plan
+  reports **byte-identical** energy, CO₂ and token counts to metered mode; only the per-token $ goes
+  away, since usage draws down an allowance bought up front and charging per token would double-count
+  against the flat fee. `plan_monthly_usd` carries the fee and surfaces as its own `!cost` footer line
+  **below** the usage total (it is owed whether or not a token is sent, so folding it in would make a
+  total that grows with traffic when it doesn't). Per-request tool spend still bills under a plan.
+  Set it per provider in config: `providers.qwen = {"cost_mode": "plan", "plan_monthly_usd": 3}`;
+  unknown modes, non-numeric fees and a fee without `cost_mode="plan"` all warn at startup instead of
+  failing quietly. **Deliberately NOT built: a credits counter** — the OpenAI-compatible endpoint
+  returns tokens, not Credits, and the token→Credit ratio is Alibaba's to define, so a local
+  conversion would be invented precision. No provider ships as `"plan"`; absent config is byte-for-byte
+  the old behavior. Offline-validated: `scratchpad/test_plan_cost_mode.py` (26/26, config scenarios in
+  subprocesses since `from_config` mutates the module constants in place).
+- **Gemini 3.1 Pro vs Gemini 4 Argon, priced out.** Argon is **cheaper than our current head right
+  now and dearer from 2026-12-01**. At ≤200k: 3.1-pro-preview is $2/$12, Argon $2/$10 today → $4/$20 on
+  Dec 1. Above 200k, 3.1-pro tiers to $4/$18 while Argon stays flat, so Argon is much cheaper today and
+  roughly a wash after. For a 50k-in/2k-out turn: $0.124 on 3.1-pro, $0.120 on Argon now, **$0.240 on
+  Argon from Dec 1** (~1.9×). The decider for us isn't the per-token rate though — **Argon does not
+  support explicit caching**, so the bookclub `cachedContents` path (which takes a 452k fic from
+  ~$1.81/turn inline to ~$0.45/turn cached) simply cannot be built on it. Staying on
+  `gemini-3.1-pro-preview` is correct; it is still preview with no retirement date.
+
+### ✅ Provider-doc sweep + per-request tool cost bucket (2026-11-07)
+Triggered by unread provider mail. Every claim below was checked against the provider's own docs or
+console, not inferred.
+- **Rei is SAFE.** `qwen3.8-flash` is **not** on either Alibaba Model Studio retirement list — both
+  notices were read in full (they render client-side, so a plain fetch returns an empty shell; the
+  browser pane got them). Notice 2009 retires the OLD `qwen-flash` generation (`qwen-flash-us`,
+  `qwen-flash-2025-07-28-us`, `qwen3-vl-flash-*-us`) and recommends `qwen3.6-flash-us` — our 3.8
+  Flash is newer than the *replacement*. Notice 2000 (postponed to 2026-10-10) retires `qwen3-max`,
+  `qwen3-vl-flash`, `qwen3-coder-plus`, the qwen3-* open weights, plus Alibaba-hosted
+  `deepseek-v3.x`/`r1`, `glm-4.6`/`4.7`, `kimi-k2-*` — all third-party models we reach through other
+  providers, so none of it touches us. Alibaba's own `deepseek-v4-flash`/`-us` are retired there too;
+  irrelevant, Melchior is on DeepSeek's own API.
+- **New: per-request tool cost bucket.** DeepSeek's Search & Fetch APIs bill **$0.75 per 1,000
+  successful requests each, metered separately**, live since **2026-10-31 16:00 UTC** (a request bills
+  only on HTTP 200 with a non-empty result; failures/empties/timeouts are free; `count` doesn't change
+  the price). `ModelProvider` gained `search_cost_per_1k_requests` / `fetch_cost_per_1k_requests`
+  (0.0 everywhere else, so no other head is affected), counters, and `record_tool_requests()` —
+  deliberately NOT `record_usage`, because request-priced spend must stay out of the token buckets and
+  the per-token energy/CO₂ estimate. Dollars are metered at record time like `total_token_cost`, so a
+  rate change never reprices history; `get_cost()` adds it, and `!cost` gives it its own
+  "(incl. $X for N search + N fetch tool calls)" clause. It bills even under `cost_mode="local"` —
+  a self-host pays nothing for inference but Search/Fetch is a hosted service. **Nothing calls it
+  yet** (search runs on Tavily); it exists so switching on native search can't silently under-report,
+  the same failure shape as the 2026-09 cache-hit gap.
+- **Stale constants found, deliberately left alone:** `DEEPSEEK_PROVIDER.supports_vision=False` is now
+  factually wrong (native multimodal since 2026-09-10; `deepseek-flash` takes images as base64 /
+  http(s) URL / Files API id, JPEG·PNG·GIF·WebP, ≤1024 tokens per image, 600 per request, user
+  messages only). Flipping it changes routing — image turns would stop going to Claude/Gemini — so
+  it's a product decision, documented at the constant. `_augment_with_url_extracts`' "Deepseek
+  (text-only)" rationale is inaccurate for the same reason.
+- **Fixed: Kimi plain turns no longer bill max effort.** The K3 series always thinks and defaults to
+  `reasoning_effort="max"`, and our shim only sent the field under `!think` — so every plain `!kimi`
+  chat turn ran at MAX reasoning on the priciest open head, silently, since July. New
+  `plain_reasoning_effort` field (mirroring Claude's `CLAUDE_PLAIN_EFFORT`/`CLAUDE_THINKING_EFFORT`
+  split); the shim now picks a tier per turn instead of only sending one under `!think`. Moonshot gets
+  `plain="low"` / `think="max"`; **"low" is the floor, not "off"** — K3 cannot stop thinking.
+  ⚠️ Both tiers are cleared on the **`fireworks` backend**, which is what the live config.json
+  actually uses: "always max" is documented for Moonshot's hosted K3, Fireworks serves the open
+  weights and may not implement the param, and a rejected param fails the whole turn — so guessing
+  there would risk breaking plain `!kimi` to chase a saving. **On the live config this fix is
+  therefore inert** until someone runs one `!kimi` and one `!think !kimi` against Fireworks; if the
+  param is accepted, set the two tiers in the backend dict. Both tiers are now in
+  `_BACKEND_FIELD_MAP` and — load-bearing — in the new **`_BACKEND_NULLABLE_FIELDS`**, because
+  `_apply_backend` skips a `None` override otherwise and the backend would silently inherit "low".
+  Offline-validated: `scratchpad/test_kimi_effort_tiers.py` (22/22, one file that resolves the
+  Moonshot vs Fireworks routes by base_url so it runs unchanged in both repos despite their
+  inverted defaults).
+- Unverifiable from docs: DeepSeek's per-token price table and exact peak-hour window are published
+  only as images, so our constants there stay as-is (off-peak = 50% of peak matches our 2× multiplier).
+- Offline-validated: new `scratchpad/test_tool_request_cost.py` (31/31 — rate placement, separate
+  metering, isolation from token/energy buckets, peak-surcharge exclusion, local mode, persistence
+  round trip incl. pre-2026-11 saves, and no retroactive repricing).
 
 ### ✅ Prompt-cache ordering: volatile context moved off the cached prefix (2026-11-07)
 Every head but Claude does automatic prefix caching, matched on the longest common prefix — and

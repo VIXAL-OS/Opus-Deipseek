@@ -124,6 +124,56 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ Kimi → K3.1 Pro, DeepSeek vision on, prepaid-plan cost mode (2026-11-07)
+Full detail in CLAUDE.md.
+- **Kimi `kimi-k3` → `kimi-k3.1-pro`**: $2.00/$10.00/$0.20 cached vs K3's $3/$15/$0.30 — better and
+  cheaper. Read off platform.kimi.ai in a BROWSER (the table renders client-side; aggregators quote
+  reseller rates). Context exactly 1,048,576. Cache hits confirmed in the standard
+  `prompt_tokens_details.cached_tokens`. ⚠️ **Inert on the live config**, which pins
+  `providers.kimi.backend="fireworks"`, and Fireworks has no serverless `kimi-k3.1-pro` — enabling it
+  means dropping the override + `MOONSHOT_API_KEY`, i.e. China egress and a second bill. ⚠️ Cache
+  WRITES ($2/MTok at 5m, $4/MTok at 1h) are unmodelled, so `!cost` under-reports a cold Kimi prefix.
+- **DeepSeek `supports_vision=True`**: native multimodal since 2026-09-10; 1024-token cap per image,
+  ≤600 images, user messages only. No new wiring —
+  `_convert_messages_to_openai_format` already emits OpenAI `image_url`. Routing effect: `vision_pool`
+  now includes Melchior, so image turns are no longer forced to Claude/Gemini.
+- **New `cost_mode="plan"`** for prepaid subscriptions (Alibaba Token Plan). Energy/CO₂ and token
+  counts come out byte-identical to metered, because they read the token counters and never consult
+  `cost_mode` — only the per-token $ drops, since usage draws a prepaid allowance. `plan_monthly_usd`
+  footers below the usage total. Config: `providers.qwen = {"cost_mode":"plan","plan_monthly_usd":3}`.
+  No credits counter on purpose (the endpoint returns tokens, not Credits).
+  `scratchpad/test_plan_cost_mode.py` (26/26).
+- **Gemini Argon vs 3.1 Pro**: Argon is cheaper today ($2/$10 vs $2/$12) and dearer from 2026-12-01
+  ($4/$20). But **Argon has no explicit caching**, which kills the bookclub `cachedContents` path, so
+  staying on `gemini-3.1-pro-preview` is correct.
+
+### ✅ Provider-doc sweep + per-request tool cost bucket (2026-11-07)
+Checked against providers' own docs/console, not inferred. Full detail in CLAUDE.md.
+- **Rei is SAFE**: `qwen3.8-flash` is on neither Alibaba retirement list. Both notices were read in
+  the browser pane (they render client-side; a plain fetch returns an empty shell). Notice 2009
+  retires the old `qwen-flash` generation and recommends `qwen3.6-flash-us` — ours is newer than the
+  replacement. Notice 2000 retires `qwen3-max`/`qwen3-vl-flash`/`qwen3-coder-plus` and Alibaba-hosted
+  `deepseek-v3.x`/`glm-4.x`/`kimi-k2-*`, none of which we reach through Alibaba.
+- **New per-request tool cost bucket**: DeepSeek Search & Fetch bill **$0.75/1,000 successful requests
+  each, separately**, live 2026-10-31 16:00 UTC. `search_cost_per_1k_requests` /
+  `fetch_cost_per_1k_requests` (0.0 elsewhere) + counters + `record_tool_requests()` — kept out of
+  `record_usage` so request-priced spend never enters the token buckets or the per-token energy/CO₂
+  estimate. Dollars metered at record time; `!cost` gets its own clause; bills even under
+  `cost_mode="local"`. Nothing calls it yet (Tavily does our search) — it exists so enabling native
+  search can't silently under-report. `scratchpad/test_tool_request_cost.py` (31/31).
+- **Stale but deliberately unchanged**: `DEEPSEEK_PROVIDER.supports_vision=False` is now wrong
+  (native vision since 2026-09-10); flipping it changes routing, so it's a product call, documented at
+  the constant.
+- **Fixed: Kimi plain turns no longer bill max effort.** The K3 series always thinks and defaults to
+  `reasoning_effort="max"`, and the shim only sent the field under `!think`, so plain `!kimi` ran at
+  MAX reasoning since July. New `plain_reasoning_effort` tier (mirrors Claude's plain/thinking effort
+  split); Moonshot gets `plain="low"`/`think="max"` ("low" is the floor — K3 can't stop thinking).
+  ⚠️ Cleared on the `fireworks` backend, which the live config.json uses: the default is documented
+  for Moonshot only, and a param Fireworks rejects fails the turn — so the fix is **inert on the live
+  config** until one plain + one `!think` Kimi turn is smoke-tested there. Needed a new
+  `_BACKEND_NULLABLE_FIELDS` list, since `_apply_backend` skips `None` overrides and the backend would
+  otherwise inherit "low". `scratchpad/test_kimi_effort_tiers.py` (22/22, runs in both repos).
+
 ### ✅ Prompt-cache ordering: volatile context moved off the cached prefix (2026-11-07)
 Every head but Claude does automatic prefix caching, matched on the longest common prefix — and
 `_generate_response` was joining three CHURNING blocks into the system message ahead of the history:

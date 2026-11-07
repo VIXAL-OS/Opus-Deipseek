@@ -55,11 +55,14 @@ check("name/id are Kimi/kimi", K.name == "Kimi" and K.id == "kimi")
 check("openai_compatible on api.moonshot.ai/v1",
       K.sdk_type == "openai_compatible" and K.base_url == "https://api.moonshot.ai/v1")
 check("key env is MOONSHOT_API_KEY", K.api_key_env == "MOONSHOT_API_KEY")
-check("model slug kimi-k3", K.model_id == "kimi-k3")
-check("pricing 3/15, cached 0.30",
-      K.input_cost_per_million == 3.0 and K.output_cost_per_million == 15.0
-      and K.cached_input_cost_per_million == 0.30)
-check("1M context", K.max_context_tokens == 1_000_000)
+# Moved K3 → K3.1 Pro on 2026-11-07: better AND cheaper ($2/$10/$0.20 vs
+# $3/$15/$0.30), per platform.kimi.ai/docs/pricing/chat read in a browser.
+check("model slug kimi-k3.1-pro", K.model_id == "kimi-k3.1-pro")
+check("pricing 2/10, cached 0.20",
+      K.input_cost_per_million == 2.0 and K.output_cost_per_million == 10.0
+      and K.cached_input_cost_per_million == 0.20)
+check("1,048,576 context (exact, all K3 series)",
+      K.max_context_tokens == 1_048_576)
 check("vision off, tavily search", K.supports_vision is False and K.search_backend == "tavily")
 check("think quirk: reasoning_effort=max, no thinking-param quirks",
       K.think_reasoning_effort == "max"
@@ -80,8 +83,8 @@ check("label regex strips a [Kimi] echo", strip_re.sub("", "[Kimi] hello") == "h
 
 print("== cost math ==")
 K.record_usage(1_000_000, 1_000_000, cached_input_tokens=1_000_000)
-check("1M in + 1M out + 1M cached = $18.30", abs(K.get_cost() - 18.30) < 1e-9,
-      f"got {K.get_cost()}")
+check("1M in + 1M out + 1M cached = $12.20 (K3.1 Pro rates)",
+      abs(K.get_cost() - 12.20) < 1e-9, f"got {K.get_cost()}")
 K.total_input_tokens = K.total_output_tokens = K.total_cached_input_tokens = 0
 
 print("== themes ==")
@@ -107,8 +110,14 @@ check("panel_members_all includes Kimi", '"GLM", "Kimi",' in src)
 check("_estimate_confidence has an override-only Kimi branch",
       'provider.name == "Kimi"' in inspect.getsource(bot.ClaudeBot._estimate_confidence))
 shim_src = inspect.getsource(bot.ClaudeBot._generate_openai_compatible_response)
-check("shim sends reasoning_effort when thinking + quirk set",
-      'api_kwargs["reasoning_effort"] = provider.think_reasoning_effort' in shim_src)
+# Structure check only — which tier is sent on which turn is covered
+# functionally by test_kimi_effort_tiers.py. K3 always thinks and defaults to
+# "max", so the shim must choose a tier per turn rather than send one only when
+# thinking is on (2026-11-07).
+check("shim picks a reasoning_effort tier per turn (plain vs thinking)",
+      "provider.think_reasoning_effort" in shim_src
+      and "provider.plain_reasoning_effort" in shim_src
+      and 'api_kwargs["reasoning_effort"]' in shim_src)
 
 print("== registry, scenario A: no MOONSHOT_API_KEY ==")
 regA = bot.ProviderRegistry.from_config({})
