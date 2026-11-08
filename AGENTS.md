@@ -139,6 +139,24 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-08
 
+### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
+Full detail in CLAUDE.md. The channel recovered and `!cost` live-confirmed both new features
+(`Chosen by: auto 35% · yours 65%`, `Per $ ... Deepseek 5.3k g`). It also exposed three things no
+fixture had, because the real fleet is **eight** providers — seven heads plus the Haiku
+participation gate.
+- **Table alignment:** the gate's 24-char `provider.name` overflowed a `{:<9}` field and welded a
+  row number onto a share (`<1%8 Mistral`). Display-only `short()` truncation; the canonical
+  `provider.name` is untouched and the full name stays in the prose rankings and Detail.
+- **Discord ate an underscore:** `AMORTIZETRAINING=0`. A bare `_` is an italics delimiter and this
+  one paired across lines. Now a code span; mirrored to ISAIC, where Slack mrkdwn is the same.
+  Anything printing an identifier to Discord or Slack needs backticks.
+- **Detail vanished wholesale** at 8 providers. It now fills to the budget and declares what it
+  dropped (Detail is spend-ordered, so the useful rows are first). A first attempt reserved 60
+  chars for a 78-char note and produced a 2,002-char message — rejected by the very guard meant to
+  prevent it — so the trim now shrinks until it fits, with a hard cut as a last resort.
+- Not a bug: no `machinery` bucket appeared, because the gate's tokens all predate the counter and
+  it had not billed since the restart. `test_cost_summary_format.py` 49 → 65/65.
+
 ### 🔴→✅ LIVE OUTAGE: an image in an assistant turn 400'd every turn (2026-11-08)
 Full detail in CLAUDE.md. Both heads began failing on every message in a channel, including a plain
 greeting with no image: Deepseek *"Image in assistant message is not supported"*, Claude

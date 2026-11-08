@@ -14,6 +14,7 @@ Imports `bot` by default; set BOT_MODULE=isaic.core for the Slack bot's copy.
 import copy
 import importlib
 import os
+import re
 import sys
 
 sys.path.insert(0, os.getcwd())
@@ -257,10 +258,78 @@ heavy[4].cost_mode, heavy[4].plan_monthly_usd = "plan", 3.0
 hout = mgr().get_cost_summary(heavy)
 check(f"the worst case is held under the limit ({len(hout)} chars)",
       len(hout) < 2000)
-check("and it is Detail that was dropped, not the rankings",
-      "detail omitted" in hout and "by cost" in hout and "Per Mtok" in hout)
+check("and it is Detail that gave way, not the rankings",
+      "omitted" in hout and "by cost" in hout and "Per Mtok" in hout)
+check("some Detail still survives rather than all of it vanishing",
+      hout.count("\n  **") > 0)
 check("an ordinary summary is NOT truncated",
-      "detail omitted" not in out and "**Detail**" in out)
+      "omitted" not in out and "**Detail**" in out)
+
+print("\nthe live 8-provider fleet (2026-11-08)")
+# The real fleet is 7 heads PLUS the Haiku participation gate, whose name is
+# 24 characters. On its first live run that overflowed the 9-char name field,
+# slid the right-hand column, and welded a row number onto a share ("<1%8
+# Mistral"); the whole Detail section also vanished rather than showing the
+# providers worth reading.
+gate = provider(bot.CLAUDE_PROVIDER, 40, 60_000, 2_000)
+gate.name = "Haiku participation gate"
+gate.est_wh_per_1k_tokens, gate.grid_gco2_per_kwh = 0.2, 400.0
+gate.input_cost_per_million, gate.output_cost_per_million = 1.0, 5.0
+gate.cached_input_cost_per_million = 0.1
+fleet = [provider(c, 50, 500_000, 20_000, 100_000) for c in (
+    bot.CLAUDE_PROVIDER, bot.DEEPSEEK_PROVIDER, bot.GEMINI_PROVIDER,
+    bot.MISTRAL_PROVIDER, bot.QWEN_PROVIDER, bot.GLM_PROVIDER,
+    bot.KIMI_PROVIDER)] + [gate]
+eight = mgr().get_cost_summary(fleet)
+check(f"8 providers fit Discord's limit ({len(eight)} chars)", len(eight) <= 2000)
+
+table = [r for r in eight.split("```")[1].strip().splitlines()[1:] if r.strip()]
+check("every ranking row is the same width (the alignment bug)",
+      len({len(r) for r in table}) == 1)
+check("all 8 rows are present", len(table) == 8)
+check("the long name is truncated, not left to overflow",
+      any("\u2026" in r for r in table)
+      and not any("Haiku participation gate" in r for r in table))
+check("no row welds a number onto the previous share",
+      not any(re.search(r"%\d", r) for r in table))
+check("the canonical provider.name is NOT mutated by display",
+      gate.name == "Haiku participation gate")
+check("and the full name still appears in the prose rankings",
+      "Haiku participation gate" in
+      [l for l in eight.splitlines() if "Per Mtok" in l][0])
+
+print("\nDetail degrades gracefully instead of vanishing")
+kept = [l for l in eight.splitlines() if l.startswith("  **")]
+check("some per-provider detail survives", len(kept) > 0)
+check("it is the highest-spend providers that are kept",
+      kept[0].startswith("  **Claude**"))
+note = [l for l in eight.splitlines() if "more provider line(s) omitted" in l]
+check("and the omission is declared", len(note) == 1)
+# No cache storage in this fixture, so one detail line == one provider.
+claimed = int(re.search(r"\((\d+) more", note[0]).group(1))
+check("the declared count matches what was actually dropped",
+      claimed == len(fleet) - eight.count("\n  **"))
+check("and nothing was dropped silently",
+      claimed > 0 and eight.count("\n  **") + claimed == len(fleet))
+
+print("\neven a pathological fleet cannot exceed the limit")
+many = []
+for i in range(20):
+    q = provider(bot.CLAUDE_PROVIDER, 10, 100_000, 5_000)
+    q.name = f"Very Long Provider Name {i}"
+    many.append(q)
+huge = mgr().get_cost_summary(many)
+check(f"20 providers still fit ({len(huge)} chars)", len(huge) <= 2000)
+check("and the rankings survive even then", "by cost" in huge)
+
+print("\nDiscord markdown cannot eat an identifier")
+# A bare underscore is an italics delimiter, and AMORTIZE_TRAINING's paired
+# with a marker on a later line, swallowing both and printing
+# "AMORTIZETRAINING".
+amort = [l for l in out.splitlines() if "amortized training" in l]
+if amort:
+    check("AMORTIZE_TRAINING is inside a code span",
+          "`AMORTIZE_TRAINING=0`" in amort[0])
 
 print("\nit still fits a Discord message")
 every = [provider(c, 50, 500_000, 20_000, 100_000) for c in (

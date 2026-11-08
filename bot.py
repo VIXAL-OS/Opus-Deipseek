@@ -3016,14 +3016,29 @@ class ConversationManager:
         by_co2 = sorted(rows, key=lambda r: r["co2"], reverse=True)
 
         lines = ["\U0001F4B0 **Cost Summary**", "```"]
+        def short(name):
+            """Fit a provider name to the column.
+
+            provider.name is the canonical ROUTING key and must never be
+            renamed (see CLAUDE.md), but it is not written for a 9-character
+            field: "Haiku participation gate" overflowed it on the first live
+            8-provider summary, pushing the right-hand column out and welding
+            the row number onto the previous share ("<1%8 Mistral"). The table
+            only works while every row is the same width, so display truncates
+            and the canonical name stays untouched.
+            """
+            return name if len(name) <= 9 else name[:8] + "\u2026"
+
         lines.append("{:<26}{}".format("by cost", "by CO2e"))
         for i in range(len(rows)):
             c, e = by_cost[i], by_co2[i]
             c_v = c["cost"] + c["storage"]
             left = "{} {:<9}{:>9}{:>5}".format(
-                i + 1, c["p"].name, money(c_v), share(c_v, spend_total))
+                i + 1, short(c["p"].name), money(c_v),
+                share(c_v, spend_total))
             right = "{} {:<9}{:>9}{:>5}".format(
-                i + 1, e["p"].name, mass(e["co2"]), share(e["co2"], co2_g_total))
+                i + 1, short(e["p"].name), mass(e["co2"]),
+                share(e["co2"], co2_g_total))
             lines.append("{:<26}{}".format(left, right))
         lines.append("```")
 
@@ -3088,8 +3103,13 @@ class ConversationManager:
             # the ~90 characters of headroom this message has left.
             lines.append(
                 "   **+ amortized training**: ~ {} CO2e over a ~{:.0f}T-token "
-                "lifespan — squishiest estimate here; AMORTIZE_TRAINING=0 to "
-                "hide.".format(mass(train_co2_g_total),
+                # Backticks are load-bearing: Discord reads a bare
+                # underscore as an italics delimiter, and this one paired with
+                # the marker on a later line, eating BOTH and rendering
+                # "AMORTIZETRAINING". Any identifier with an underscore that
+                # reaches Discord needs a code span.
+                "lifespan — squishiest estimate here; `AMORTIZE_TRAINING=0` "
+                "to hide.".format(mass(train_co2_g_total),
                                MODEL_LIFETIME_TOKENS / 1e12))
 
         # Who chose what got billed. The rankings above are volume x intensity
@@ -3169,9 +3189,30 @@ class ConversationManager:
                     "(time-based, per token-hour{})".format(r["storage"], live))
         out = "\n".join(lines)
         if len(out) > 1990:
-            out = "\n".join(head + [
-                "_(per-provider detail omitted \u2014 it would push this "
-                "past Discord's 2,000-char limit)_"])
+            # Fill Detail up to the budget rather than dropping all of it: it
+            # is ordered by spend, so the rows that survive are the ones worth
+            # reading. Dropping the section wholesale is what the 8-provider
+            # fleet triggered on its first live run.
+            #
+            # Shrink until it FITS rather than reserving a guessed number of
+            # characters for the closing note: a first attempt reserved 60 and
+            # the note was 78, which put the message at 2,002 -- i.e. still
+            # rejected, by a feature meant to prevent exactly that.
+            detail = lines[len(head):]
+            note = ("  _({} more provider line(s) omitted \u2014 Discord caps "
+                    "a message at 2,000 chars)_")
+            for keep in range(len(detail), -1, -1):
+                omitted = len(detail) - keep
+                body = head + detail[:keep]
+                if omitted:
+                    body = body + [note.format(omitted)]
+                out = "\n".join(body)
+                if len(out) <= 1990:
+                    break
+            # Last resort, so an over-length message is impossible no matter
+            # how the head grows: a hard cut Discord will still accept.
+            if len(out) > 1990:
+                out = out[:1987] + "\u2026"
         return out
 
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:

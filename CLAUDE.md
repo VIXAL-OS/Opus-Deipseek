@@ -162,6 +162,42 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-08
 
+### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
+The fix above worked: the channel answered normally, Deepseek even explained its own outage. The
+`!cost` that followed **live-confirmed both new features** — `🎲 Chosen by: auto 35% · yours
+65% · 63.8M unattributed` and `💵 Per $ ... Claude 60 · ... Deepseek 5.3k g` — and exposed
+three things no offline fixture had, because **the real fleet is EIGHT providers, not seven**: the
+seven heads plus the Haiku participation gate.
+- **The ranking table came apart.** `provider.name` for the gate is `"Haiku participation gate"`,
+  24 chars against a `{:<9}` field, so the row overflowed, pushed the right-hand column out, and
+  welded a row number onto the previous share: `8 Haiku participation gate   <$0.01  <1%8 Mistral`.
+  Fixed with a display-only `short()` that truncates to 8 chars + `…`; **the canonical
+  `provider.name` is untouched** (it is the routing key) and the full name still appears in the
+  prose rankings and Detail, where width is not load-bearing. Pinned by a check that every ranking
+  row is the same width and that no row matches `%\d`.
+- **Discord ate an underscore.** The amortized-training line printed `AMORTIZETRAINING=0`: a bare
+  `_` is an italics delimiter, and this one paired with the marker on a *later* line, consuming
+  both. Now a code span: `` `AMORTIZE_TRAINING=0` ``. **Mirrored to ISAIC**, where Slack mrkdwn has
+  the same rule. General lesson, worth remembering for anything new that prints an identifier: an
+  underscore that reaches Discord or Slack needs backticks.
+- **Detail vanished wholesale** (`(per-provider detail omitted — ...)`) because 8 providers blow
+  the 1,990 budget. The guard did its job, but all-or-nothing was the wrong design: Detail is
+  ordered by spend, so the rows worth reading are at the top. It now **fills to the budget** and
+  declares what it dropped. A first attempt reserved 60 characters for the closing note while the
+  note was 78, producing a **2,002-char message — still rejected, by the very feature meant to
+  prevent that** — so the trim now shrinks until it genuinely fits, with a hard cut as a last
+  resort so an over-length `!cost` is impossible however the head grows. 20 providers with 24-char
+  names render in 1,988.
+- **Not a bug:** the live line showed no `machinery` bucket. Correct — the participation gate's
+  lifetime tokens all predate the counter, and it had not billed since the restart, so there was
+  nothing attributable to machinery yet. The gate DOES appear in the per-Mtok and per-$ rankings
+  (80 g/Mtok, 66 g/$), which is itself useful: it is the cheapest head per dollar after Mistral and
+  Gemini.
+- Offline-validated: `scratchpad/test_cost_summary_format.py` 49 → **65/65**, now including the
+  real 8-provider fleet with the gate's actual 24-char name, row-width equality, the
+  `%\d` collision, canonical-name immutability, graceful Detail degradation with an accurate
+  dropped count, a 20-provider pathological case, and the code span. Full suite green.
+
 ### 🔴→✅ LIVE OUTAGE: an image in an assistant turn 400'd every turn (2026-11-08)
 At 08:26 both heads started failing on *every* message in a channel — on a plain "salam aleykum"
 that contained no image at all:
