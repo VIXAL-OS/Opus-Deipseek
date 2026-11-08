@@ -147,6 +147,57 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ Carbon constants corrected + a volume-free per-token ranking (2026-11-07)
+Sarah pushed back on the headline from the `!cost` rewrite — *"i thought china had a lot of
+wind/hydro/solar… and anthropic bought that colossus cluster lolsob"* — and was right on both
+counts plus a third. The fix moves the ranking.
+- **Claude `grid_gco2_per_kwh` 250 → 400.** The old 250 was justified in-comment as "AWS fleet:
+  RECs + clean anchors", i.e. **market**-based accounting — but the field is defined two screens up
+  as the intensity of the grid the endpoint *physically* runs on. Certificates don't move electrons,
+  so the premium head was being flattered by our own definition's standards. Two facts make it
+  worse: **2026-05-06 Anthropic leased ALL of Colossus 1** (Memphis TN, 300+ MW, 220k+ GPUs) from
+  SpaceX — *leased*, not bought, and explicitly to serve Claude Pro/Max, i.e. **inference**, which
+  is exactly what this field prices; and that site runs mostly on **~35 on-site simple-cycle methane
+  turbines (~422 MW, against a 15-turbine permit — litigated by SELC/NAACP)**, topped up by
+  ~150–250 MW of TVA grid. Simple-cycle gas is dirtier than the combined-cycle IPCC AR5 lifecycle
+  median (~490 g/kWh); TVA's own 2025 system average is 721.69 lb/MWh = **~327 g/kWh**. Anthropic's
+  AWS Trainium / GCP TPU capacity is cleaner and the blend isn't knowable from outside, so 400 = the
+  US average = our global fallback. ⚠️ **Direction of residual error: if Memphis carries more of
+  the serving load than the rest of the fleet, 400 is still LOW.**
+- **China is no longer a coal-grid number.** Her instinct was right — the renewables build-out has
+  pulled the national average to **~530 g/kWh** (MEE/NBS official, 2023), ~526 (Ember 2025), ~589
+  (IEA 2025). Our 550 sits mid-spread and **stays**; what was wrong was the *contrast*. 250-vs-550
+  implied a ~2× gap where the real one is **~1.3×**. Comment rewritten at the constant (east-CN
+  runs above national average; Sichuan hydro ~112, Inner Mongolia coal much higher).
+- **Effect on the headline:** on the same traffic DeepSeek's share of emissions falls 83% → 76% and
+  Claude's rises 15% → 22%.
+- **New: a volume-free `⚖️ Per Mtok` line.** Her third point was the sharpest — cumulative CO₂e is
+  *volume × intensity*, and volume is a **routing/override artifact, not a property of a model**, so
+  a cheap head that auto-routing picks constantly tops the CO₂e column while being among the
+  cleanest things in the fleet per token. The new line is ordered cleanest-first and computed as
+  `est_wh_per_1k_tokens × grid` (Wh per 1k tokens is numerically also kWh per Mtok, so the figure is
+  just that product — no new state). On the live fleet: **Mistral 7 · Qwen 60 · Gemini 65 ·
+  Deepseek 110 · GLM 180 · Kimi 200 · Claude 240 g/Mtok** — so **per token Claude is ~2.2×
+  DeepSeek**, the exact inverse of the cumulative column. Both are true and they answer different
+  questions ("what did we emit?" vs "what should we route to?"), which is why the volume-free one
+  gets its own line instead of being left to inference. Guarded against regression by a check that
+  the figure is unchanged at 10× the traffic.
+  ⚠️ Those are the figures for the LIVE backends: Kimi reads 275 on the bare Moonshot
+  constant (grid 550) but the live config pins `backend="fireworks"` (grid 400) → 200.
+- Amortized training points the same way: ~8,000 tCO₂e (Claude, est.) vs ~1,000 (DeepSeek) over the
+  same 100T-token horizon, so **counting training makes the premium head look worse, not better** —
+  also as she guessed.
+- **New: a 2,000-char guard.** These additions took the 7-head worst case to **1,908**, and a real
+  summary carrying peak surcharges, tool-call clauses and a plan footer can pass Discord's hard
+  limit — an over-length message is **rejected outright**, so `!cost` would have silently failed
+  rather than truncated. Detail is now dropped (with a note) when the whole would exceed 1,990; the
+  rankings and totals never are. Detail also picked up the `<1 g` treatment the rankings had.
+- Offline-validated: `scratchpad/test_cost_summary_format.py` 23 → **36/36**. Full suite green.
+- ⚠️ **Still estimates, and the remaining error moved.** The grids are now defensible; the squishy
+  part is `est_wh_per_1k_tokens`, which is order-of-magnitude and unsourced per provider. **Gemini's
+  130 is derived from Google's ~66% CFE figure, which is itself partly market-based** — the same
+  critique as the old Claude number, left alone pending a location-based source. Never routed on.
+
 ### ✅ `!cost` rewritten: ranked by cost AND carbon, with everyday equivalents (2026-11-07)
 The old layout listed providers in **registry order**, three lines each, which buried the one
 genuinely surprising thing in the data: **cost and carbon rank differently.** On real figures Claude

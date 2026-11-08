@@ -867,7 +867,25 @@ CLAUDE_PROVIDER = ModelProvider(
     supports_vision=True,
     supports_web_search=True,
     est_wh_per_1k_tokens=0.6,  # large frontier model, but Anthropic ranks high on per-query efficiency
-    grid_gco2_per_kwh=250.0,   # AWS fleet: RECs + clean anchors (e.g. the PA nuclear Anthropic capacity)
+    # RAISED 250 → 400 on 2026-11-07. The old 250 was justified by "RECs +
+    # clean anchors", i.e. MARKET-based accounting — which contradicts what
+    # this field is defined to mean two screens up: the intensity of the grid
+    # the endpoint PHYSICALLY runs on. Certificates do not change the
+    # electrons, so leaning on them flattered the premium head. Location-based
+    # is the consistent choice, and the fleet moved the wrong way:
+    #   • 2026-05-06 Anthropic leased ALL of Colossus 1 (Memphis, TN, 300+ MW,
+    #     220k+ GPUs) from SpaceX, explicitly to serve Claude Pro/Max — so it
+    #     is INFERENCE capacity, which is what this field prices.
+    #   • That site runs mostly on ~35 on-site simple-cycle methane turbines
+    #     (~422 MW, against a 15-turbine permit — litigated by SELC/NAACP),
+    #     topped up by ~150–250 MW of TVA grid. Simple-cycle gas is dirtier
+    #     than the combined-cycle IPCC AR5 lifecycle median of ~490 g/kWh;
+    #     TVA's own 2025 system average is 721.69 lb/MWh = ~327 g/kWh.
+    # Anthropic's own AWS Trainium + GCP TPU capacity is cleaner, and the blend
+    # is not knowable from outside, so this sits at the US average (= the
+    # global fallback). Direction of the remaining error: if Memphis carries
+    # more of the serving load than the rest of the fleet, 400 is still LOW.
+    grid_gco2_per_kwh=400.0,
     train_tco2e=8000.0,        # undisclosed — order-of-magnitude estimate for an Opus-class US train
 )
 
@@ -927,7 +945,14 @@ DEEPSEEK_PROVIDER = ModelProvider(
     # Deepseek has no native web search; route through Tavily.
     search_backend="tavily",
     est_wh_per_1k_tokens=0.2,  # V4.1 Flash: 552B MoE, ~8B active in / ~16B out (V4 Pro ~49B → was 0.3)
-    grid_gco2_per_kwh=550.0,   # DeepSeek China API (east-CN grid; province-dependent — Sichuan hydro ~112, Inner Mongolia coal higher). fireworks backend → ~400; self-host → your grid
+    # China's grid is NOT a coal-grid figure any more — massive wind/solar/hydro
+    # build-out has pulled the national average down to ~530 g/kWh (MEE/NBS
+    # official, 2023), ~526 (Ember 2025), ~589 (IEA 2025). 550 sits mid-spread.
+    # So the honest gap to a US endpoint is ~1.3×, not the ~2× our old Claude
+    # figure implied. Still province-dependent (Sichuan hydro ~112, Inner
+    # Mongolia coal much higher) and east-CN runs above national average.
+    # fireworks backend → ~400; self-host → your grid.
+    grid_gco2_per_kwh=550.0,
     train_tco2e=1000.0,        # ~1.4 GWh for V3 (2.78M GPU-hrs); V4 est. — very training-efficient
     # Backend toggle (Phase 3). Default "api" (above) = China api.deepseek.com.
     # The Discord bot stays on "api" by design (CLAUDE.md locked deviation);
@@ -2799,6 +2824,13 @@ class ConversationManager:
                 "in": uncached_in,
                 "cached": cached_in,
                 "out": p.total_output_tokens + p.total_output_tokens_above_tier,
+                # Volume-INDEPENDENT carbon intensity: g CO2e per million
+                # tokens. est_wh_per_1k_tokens is Wh/1k tokens, which is
+                # numerically also kWh per Mtok, so this is just Wh x grid.
+                # A property of model+endpoint, unlike the cumulative figure.
+                "intensity": p.est_wh_per_1k_tokens * (
+                    p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
+                    else GRID_GCO2_PER_KWH),
             })
 
         grand_total = sum(r["cost"] for r in rows)
@@ -2876,10 +2908,23 @@ class ConversationManager:
                 "\U0001F331 **~ {:,.1f} kWh ~ {} CO2e**".format(
                     energy_wh_total / 1000.0, mass(co2_g_total))
                 + (" — {}.".format(equiv) if equiv else ""))
+            # The ranking above is volume x intensity, and volume is a
+            # routing/override artifact, not a property of a model: a cheap
+            # head that auto-routing picks constantly will top the CO2e column
+            # while being the CLEANEST thing in the fleet per token. Both
+            # facts are real and they answer different questions ("what did we
+            # emit?" vs "what should we route to?"), so the volume-free one
+            # gets its own line rather than being inferred from the table.
+            intensity_rank = sorted(rows, key=lambda r: r["intensity"])
             lines.append(
-                "   _Order-of-magnitude only: per-provider grid intensity, "
-                "non-reasoning baseline, tailpipe-only car figure. Tune "
-                "Wh/grid in code/.env._")
+                "\u2696\uFE0F **Per Mtok** (volume-free; table above = "
+                "volume \u00d7 this): " + " \u00b7 ".join(
+                    "{} {:,.0f} g".format(r["p"].name, r["intensity"])
+                    for r in intensity_rank))
+            lines.append(
+                "   _Order-of-magnitude: per-provider grid, non-reasoning "
+                "baseline, tailpipe-only car. Grids are location-based, "
+                "NOT REC-adjusted. Tune in .env._")
         if AMORTIZE_TRAINING and train_co2_g_total > 0:
             t_equiv = _co2_equivalents(train_co2_g_total)
             short = ""
@@ -2892,6 +2937,11 @@ class ConversationManager:
                 "hide.".format(mass(train_co2_g_total), short,
                                MODEL_LIFETIME_TOKENS / 1e12))
 
+        # Discord REJECTS a message over 2,000 chars outright, and the
+        # 7-head case with peak surcharges, tool-call clauses and plan
+        # footers gets close. The rankings and totals ARE the answer, so
+        # Detail is what gives way: a trimmed summary beats no summary.
+        head = list(lines)
         lines.append("**Detail**")
         for r in by_cost:
             p = r["p"]
@@ -2930,9 +2980,9 @@ class ConversationManager:
                     else GRID_GCO2_PER_KWH)
             lines.append(
                 "  **{}**: {} requests, {:,} in + {:,} out{} = {} "
-                "\u00b7 {:.1f} Wh, {:.0f} g CO2e (grid ~ {:.0f})".format(
+                "\u00b7 {:.1f} Wh, {} CO2e (grid ~ {:.0f})".format(
                     p.name, p.total_requests, r["in"], r["out"], cache_note,
-                    cost_str, r["energy"], r["co2"], grid))
+                    cost_str, r["energy"], mass(r["co2"]), grid))
             if r["storage"] > 0:
                 live = (", ${:.4f} still accruing on a live cache".format(
                     gemini_live_storage)
@@ -2940,7 +2990,13 @@ class ConversationManager:
                 lines.append(
                     "      \u23F3 + ~${:.4f} Gemini cache storage "
                     "(time-based, per token-hour{})".format(r["storage"], live))
-        return "\n".join(lines)
+        out = "\n".join(lines)
+        if len(out) > 1990:
+            out = "\n".join(head + [
+                "_(per-provider detail omitted \u2014 it would push this "
+                "past Discord's 2,000-char limit)_"])
+        return out
+
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Save all memories to disk (synchronous - use save_memories_async in async contexts)."""
         data = {
@@ -3206,7 +3262,10 @@ class ClaudeBot(commands.Bot):
             supports_vision=False,
             supports_web_search=False,
             est_wh_per_1k_tokens=0.2,
-            grid_gco2_per_kwh=250.0,
+            # Same Anthropic fleet as the chat head, so it inherits the same
+            # location-based figure (see CLAUDE_PROVIDER: 250 -> 400 on
+            # 2026-11-07, Colossus 1 / REC reasoning).
+            grid_gco2_per_kwh=400.0,
         )
         self.usage_providers = self.providers + [self.participation_usage]
         self._participation_seeded_channels: set[int] = set()

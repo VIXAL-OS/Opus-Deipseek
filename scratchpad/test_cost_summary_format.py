@@ -76,7 +76,7 @@ check("the carbon line carries a driving equivalent",
       "petrol car" in out)
 check("and a gaming equivalent", "PC gaming" in out)
 check("and says plainly that it is order-of-magnitude",
-      "Order-of-magnitude only" in out)
+      "Order-of-magnitude" in out)
 check("equivalents helper returns '' for a negligible mass",
       bot._co2_equivalents(0.4) == "")
 check("1 kg of CO2e is ~4 km of driving at 250 g/km",
@@ -113,6 +113,69 @@ tool = provider(bot.DEEPSEEK_PROVIDER, 5, 1000, 100)
 tool.record_tool_requests(search=1000)
 check("per-request tool spend still itemised",
       "tool calls" in mgr().get_cost_summary([tool]))
+
+print("\nthe volume-free per-Mtok ranking (2026-11-07)")
+# The cumulative CO2e column is volume x intensity, and volume is a routing
+# artifact. The per-Mtok line is the part that is a property of the model, so
+# it must be ordered independently of how many tokens each head was sent.
+check("the per-Mtok line is present", "Per Mtok" in out)
+mtok = [l for l in out.splitlines() if "Per Mtok" in l][0]
+check("it says plainly that it is volume-free", "volume-free" in mtok)
+check("Deepseek precedes Claude per token, the reverse of the CO2e column",
+      mtok.index("Deepseek") < mtok.index("Claude")
+      and right[0].split()[1] == "Deepseek")
+# Mistral on the France grid is the cleanest thing in the fleet per token even
+# though it is last in BOTH cumulative columns -- the exact inversion the line
+# exists to show.
+# out2 below adds Mistral; it is last in BOTH cumulative columns and first
+# per token (France grid ~20 g/kWh) -- the exact inversion the line exists for.
+m3 = [l for l in mgr().get_cost_summary([claude, deep, tiny]).splitlines()
+      if "Per Mtok" in l][0]
+check("Mistral ranks first per token despite being last cumulatively",
+      m3.split("this): ")[1].startswith("Mistral"))
+cl = copy.deepcopy(bot.CLAUDE_PROVIDER)
+ds = copy.deepcopy(bot.DEEPSEEK_PROVIDER)
+check("intensity is just Wh/1k x grid (Claude 0.6 x 400 = 240 g/Mtok)",
+      abs(cl.est_wh_per_1k_tokens * cl.grid_gco2_per_kwh - 240.0) < 0.01)
+check("and is independent of traffic (same figure at 10x the tokens)",
+      "Claude 240 g" in mtok
+      and "Claude 240 g" in mgr().get_cost_summary(
+          [provider(bot.CLAUDE_PROVIDER, 1220, 47_288_840, 1_444_060),
+           provider(bot.DEEPSEEK_PROVIDER, 4, 2_000, 100)]))
+
+print("\ngrid constants are location-based, not REC-adjusted (2026-11-07)")
+check("Claude sits at the US average, not the old REC-justified 250",
+      cl.grid_gco2_per_kwh == 400.0)
+check("China is above the US but not by the old ~2x (national avg ~530)",
+      1.2 < ds.grid_gco2_per_kwh / cl.grid_gco2_per_kwh < 1.5)
+check("per token Claude is DIRTIER than Deepseek, the fleet's cheap head",
+      cl.est_wh_per_1k_tokens * cl.grid_gco2_per_kwh
+      > ds.est_wh_per_1k_tokens * ds.grid_gco2_per_kwh)
+
+print("\nDetail never renders a mass as a bare '0 g'")
+fr = provider(bot.MISTRAL_PROVIDER, 1, 500, 20)
+dout = mgr().get_cost_summary([fr]).split("**Detail**")[1]
+check("a sub-gram provider reads '<1 g', not '0 g'",
+      "<1 g" in dout and "0 g CO2e" not in dout)
+
+print("\nthe 2,000-char guard")
+# Everything that can lengthen a line at once: 7 heads, peak surcharge, tool
+# calls and a prepaid plan. Detail is what gives way, never the rankings.
+heavy = [provider(c, 50, 500_000, 20_000, 100_000) for c in (
+    bot.CLAUDE_PROVIDER, bot.DEEPSEEK_PROVIDER, bot.GEMINI_PROVIDER,
+    bot.MISTRAL_PROVIDER, bot.QWEN_PROVIDER, bot.GLM_PROVIDER,
+    bot.KIMI_PROVIDER)]
+for h in heavy:
+    h.total_peak_surcharge = 0.1234
+    h.record_tool_requests(search=250, fetch=125)
+heavy[4].cost_mode, heavy[4].plan_monthly_usd = "plan", 3.0
+hout = mgr().get_cost_summary(heavy)
+check(f"the worst case is held under the limit ({len(hout)} chars)",
+      len(hout) < 2000)
+check("and it is Detail that was dropped, not the rankings",
+      "detail omitted" in hout and "by cost" in hout and "Per Mtok" in hout)
+check("an ordinary summary is NOT truncated",
+      "detail omitted" not in out and "**Detail**" in out)
 
 print("\nit still fits a Discord message")
 every = [provider(c, 50, 500_000, 20_000, 100_000) for c in (

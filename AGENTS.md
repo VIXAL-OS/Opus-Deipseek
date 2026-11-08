@@ -124,6 +124,30 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-07
 
+### ✅ Carbon constants corrected + a volume-free per-token ranking (2026-11-07)
+Full detail in CLAUDE.md. Sarah challenged the `!cost` headline and was right three ways.
+- **Claude grid 250 → 400.** The old 250 leaned on "RECs + clean anchors" — **market**-based
+  accounting, while the field means the grid the endpoint *physically* runs on. And the fleet moved
+  the wrong way: **Anthropic leased ALL of Colossus 1** (Memphis, 300+ MW, 2026-05-06, to serve
+  Claude Pro/Max — so *inference*), a site running mostly on **~35 on-site simple-cycle methane
+  turbines** (~422 MW, 15 permitted) plus TVA at **~327 g/kWh**. 400 = US average = global fallback.
+  ⚠️ If Memphis carries more serving load than the rest of the fleet, 400 is still LOW.
+- **China stays 550, but the contrast was wrong.** National average is ~530 g/kWh (MEE/NBS 2023),
+  ~526 (Ember 2025), ~589 (IEA 2025) — the renewables build-out is real. So the gap to a US
+  endpoint is **~1.3×, not the ~2×** our old Claude figure implied.
+- **Headline moves:** DeepSeek 83% → 76% of emissions, Claude 15% → 22%, same traffic.
+- **New `⚖️ Per Mtok` line** (volume-free): cumulative CO₂e is *volume × intensity*, and volume is
+  a routing artifact, not a property of a model. Computed as `est_wh_per_1k_tokens × grid` (Wh/1k is
+  numerically kWh/Mtok). Live fleet: **Mistral 7 · Qwen 60 · Gemini 65 · Deepseek 110 · GLM 180 ·
+  Kimi 200 · Claude 240 g/Mtok** — per token Claude is ~2.2× DeepSeek, inverting the table above.
+  Amortized training agrees (8,000 vs 1,000 tCO₂e): counting the train makes Claude look *worse*.
+  ⚠️ Those are the figures for the LIVE backends: Kimi reads 275 on the bare Moonshot
+  constant (grid 550) but the live config pins `backend="fireworks"` (grid 400) → 200.
+- **New 2,000-char guard.** The 7-head worst case is 1,908; an over-length Discord message is
+  REJECTED, not truncated, so Detail now gives way above 1,990 — never the rankings or totals.
+- `scratchpad/test_cost_summary_format.py` 23 → 36/36. ⚠️ Gemini's 130 is CFE-derived, i.e. partly
+  market-based — the same critique as the old Claude number, left pending a location-based source.
+
 ### ✅ `!cost` rewritten: ranked by cost AND carbon, with everyday equivalents (2026-11-07)
 Full detail in CLAUDE.md. The old layout listed providers in **registry order**, three lines each,
 which buried the one surprising thing in the data: **cost and carbon rank differently.** On real
