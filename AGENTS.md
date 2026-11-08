@@ -91,6 +91,13 @@ self-contained — you don't need it to pick up the remaining work below.
   an explicit `cache_control`, so `_generate_claude_response(cache_system=True)` marks the stable
   prefix; the panel/judge pass `cache_system=False` because a one-shot prompt pays the cache-WRITE
   premium ($5/M) and is never read back. Guarded by `scratchpad/test_prompt_cache_order.py`.
+- **Routing attribution rides a ContextVar, not a parameter.** `_SELECTION_MODE` (just after
+  `GRID_GCO2_PER_KWH`) carries who chose the model for the turn being billed; `record_usage` reads
+  it. It defaults to `"system"`, so a NEW utility call path needs no change — but a new **chat**
+  path MUST `_SELECTION_MODE.set(...)`, or its turns bill as machinery. Anything reached from
+  inside a chat turn that is not itself a model choice must `set` **and `reset`** (see
+  `_panel_complete`), because a bare `set` leaks for the remainder of that Task. Guarded by
+  `scratchpad/test_selection_attribution.py`.
 - **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-09-21):
   `glm-5p3`, `qwen3p8-max`, `deepseek-v4p1-flash` (under `accounts/fireworks/models/`); Qwen's
   default is now `qwen3.8-flash` on Alibaba US and DeepSeek's is `deepseek-flash` (see CLAUDE.md). Mistral on
@@ -123,6 +130,41 @@ byte-for-byte the old behavior):
 ---
 
 ## Status — 2026-11-07
+
+### ✅ `!cost` gained a per-dollar ranking — the third ordering (2026-11-07)
+Full detail in CLAUDE.md. **`💵 Per $ (lower better): Mistral 12 · Gemini 64 · Claude 77 ·
+Kimi 108 · Qwen 660 · Deepseek 5.3k g`** — a dollar on DeepSeek makes ~69× the emissions of a
+dollar on Claude, because that dollar buys ~29M tokens (89% cache hits) on a 550 g/kWh grid.
+- **The dual of per-Mtok**: per-Mtok is the metric when the WORK is fixed, per-$ when the BUDGET
+  is. Opposite rankings, neither wrong. Alone, per-$ would say "buy the priciest model" — rational
+  only under a fixed budget — so it ships *beside* per-Mtok, never instead of it.
+- **Realised, not rate-card** (`co2 / cost`), so cache hits and peak surcharges are in it: a warmer
+  cache buys more tokens per dollar, hence more waste. **Cache storage is excluded** from the
+  denominator (those dollars bought no tokens). `local`/`plan` rows are **omitted as undefined**,
+  not shown as clean.
+- Paid for in characters (shorter Per Mtok label, trimmed caveat, Detail "requests" → "req"):
+  worst case **1,895/2,000**, Detail intact. `test_cost_summary_format.py` 36 → 49/49.
+
+### ✅ `!cost` now says WHO chose the model (2026-11-07)
+Full detail in CLAUDE.md. The rankings are *volume × intensity* and say nothing about whether
+anyone MEANT to send that volume. New **`🎲 Chosen by`** line: `auto 65% · yours 24% ·
+machinery 11% · 61.5M unattributed`.
+- **Buckets by who decided:** `auto` = the heuristic's argmax (and the only-head-up case — nobody
+  chose it); `override` = a human pinned it (bare prefix, `!prefer`, `config.default_model`);
+  `system` = not a choice at all (panel, judge, recaps, `!summarize`, G2P, classifier).
+- **A ContextVar, not a threaded parameter.** `record_usage` has 11 call sites across five dispatch
+  paths and the tool loop calls it repeatedly within one request, so threading would touch them
+  all; asyncio gives each Discord event its own Task (children get a context **copy**), so a
+  `contextvars.ContextVar` read inside `record_usage` is exact under concurrency at zero churn.
+  Default `"system"`. `_panel_complete` is now a `set`/`try`/`reset` wrapper around
+  `_panel_complete_dispatch` — the reset is load-bearing, or a `!research` would re-label the rest
+  of its own chat turn as machinery.
+- **Tokens, not requests** (requests are bumped at the call sites, one request can bill several
+  times). **Legacy saves report as `unattributed`**, never folded into `auto`; the line is omitted
+  while nothing is attributed.
+- 7-head worst case **1,929/2,000**, paid for by dropping the duplicate equivalent from the
+  amortized-training line. `scratchpad/test_selection_attribution.py` 34/34; full suite green.
+- ⚠️ Not ported here. Owes one live check: a plain turn + a `!claude` turn, then `!cost`.
 
 ### ✅ Carbon constants corrected + a volume-free per-token ranking (2026-11-07)
 Full detail in CLAUDE.md. Sarah challenged the `!cost` headline and was right three ways.

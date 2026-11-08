@@ -45,6 +45,7 @@ import os
 import asyncio
 import aiohttp
 import base64
+import contextvars
 import re
 import io
 import html as _html
@@ -537,6 +538,15 @@ class ModelProvider:
     total_fetch_requests: int = 0
     total_tool_request_cost: float = 0.0
 
+    # Tokens billed, split by who chose this provider for the turn (see
+    # _SELECTION_MODE). Keyed by mode; absent keys mean zero. Deliberately
+    # TOKENS and not requests: requests are bumped at the call sites, where one
+    # logical request can call record_usage several times (tool loop, degraded
+    # retry), whereas tokens are what both dollars and carbon follow. Sums to
+    # LESS than the token totals on any save that predates this counter -- the
+    # remainder is reported as unattributed rather than guessed at.
+    total_tokens_by_selection: dict = field(default_factory=dict)
+
     def is_peak(self, when: Optional[datetime] = None) -> bool:
         """True if `when` (default: now) falls in one of this provider's
         peak-pricing windows. Ignores public holidays (DeepSeek exempts
@@ -589,6 +599,17 @@ class ModelProvider:
             self.total_output_tokens += output_tokens
             self.total_cached_input_tokens += cached_input_tokens
         self.total_token_cost += self._token_cost() - base_before
+        # Attribute this call's tokens to whoever chose this provider. Reading
+        # the ContextVar here (rather than taking a parameter) is what keeps
+        # all 11 call sites untouched; an unrecognised value is treated as
+        # machinery rather than trusted.
+        mode = _SELECTION_MODE.get()
+        if mode not in SELECTION_MODES:
+            mode = "system"
+        self.total_tokens_by_selection[mode] = (
+            self.total_tokens_by_selection.get(mode, 0)
+            + input_tokens + cached_input_tokens + output_tokens
+        )
         if peak:
             # This request's base-rate cost is the delta it just added; bill the
             # rest of the peak price on top as a surcharge.
@@ -735,6 +756,7 @@ class ModelProvider:
             "search_requests": self.total_search_requests,
             "fetch_requests": self.total_fetch_requests,
             "tool_request_cost": self.total_tool_request_cost,
+            "tokens_by_selection": dict(self.total_tokens_by_selection),
         }
 
     def load_stats(self, data: dict) -> None:
@@ -751,6 +773,10 @@ class ModelProvider:
         self.total_search_requests = data.get("search_requests", 0)
         self.total_fetch_requests = data.get("fetch_requests", 0)
         self.total_tool_request_cost = data.get("tool_request_cost", 0.0)
+        # Saves predating 2026-11-07 carry no attribution. An empty dict is the
+        # honest history: those tokens are unattributed, not auto-routed.
+        self.total_tokens_by_selection = dict(
+            data.get("tokens_by_selection") or {})
         self.total_token_cost = data.get("token_cost")
         if self.total_token_cost is None:
             if self.id == "claude":
@@ -798,6 +824,29 @@ class SearchResult:
 # precise footprint, and we never route on it.
 GRID_GCO2_PER_KWH = float(os.getenv("GRID_GCO2_PER_KWH", "400"))
 
+# Who chose the model for the turn currently being billed. Read by
+# ModelProvider.record_usage so !cost can answer a question the cumulative
+# figures cannot: was this spend the ROUTER's decision or yours? A cheap head
+# that auto-routing picks constantly dominates the CO2e column without anyone
+# ever having chosen it, and that is a routing problem; the same volume chosen
+# deliberately is not.
+#
+# A ContextVar, not a threaded parameter: record_usage has 11 call sites across
+# five dispatch paths (and the tool loop calls it repeatedly inside one logical
+# request), so threading would touch all of them, while asyncio gives each
+# Discord event its own Task -- and a child Task gets a COPY of the context --
+# so this is exact under concurrent turns at zero churn at those sites.
+#
+# Default "system": anything that is not a user-facing model choice -- panel
+# members, the judge, bookclub recaps, !summarize, G2P, the participation
+# classifier -- bills there without having to opt in. Only the chat path sets
+# one of the other two, and only _panel_complete has to force "system" back,
+# because it is reached from inside a chat turn that already set its own.
+SELECTION_MODES = ("auto", "override", "system")
+SELECTION_LABELS = {"auto": "auto", "override": "yours", "system": "machinery"}
+_SELECTION_MODE = contextvars.ContextVar("hydra_selection_mode",
+                                         default="system")
+
 # Amortization horizon for embodied TRAINING carbon (see ModelProvider.train_
 # tco2e). The dominant unknown — a frontier model serves ~10^13–10^15 tokens
 # over its ~1–2-yr life. Default 1e14 (~100T) is calibrated so Mistral's public
@@ -822,6 +871,15 @@ AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "F
 CO2_G_PER_KM_PETROL_CAR = float(os.getenv("CO2_G_PER_KM_PETROL_CAR", "250"))
 GAMING_PC_WATTS = float(os.getenv("GAMING_PC_WATTS", "400"))
 COAL_GRID_GCO2_PER_KWH = float(os.getenv("COAL_GRID_GCO2_PER_KWH", "820"))
+
+
+def _compact_tokens(n: int) -> str:
+    """Token count in as few characters as possible: 56.1M, 812k, 403."""
+    if n >= 1_000_000:
+        return "{:.1f}M".format(n / 1_000_000)
+    if n >= 1_000:
+        return "{:.0f}k".format(n / 1_000)
+    return str(n)
 
 
 def _co2_equivalents(co2_g: float) -> str:
@@ -2832,6 +2890,25 @@ class ConversationManager:
                     p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
                     else GRID_GCO2_PER_KWH),
             })
+        # g CO2e per dollar of TOKENS -- "if I spend a dollar here, how much
+        # waste do I make for it?" The dual of "intensity": that one is the
+        # metric when the work is fixed and you want the least emissions per
+        # unit of work, this one when the BUDGET is fixed and you want the
+        # least emissions per unit of spend. They rank differently because a
+        # dollar buys wildly different token counts -- a cheap head on a dirty
+        # grid is the worst thing you can spend a dollar on even while being
+        # the cleanest thing you can send a token to.
+        #
+        # REALISED, not rate-card: cost and co2 are both what actually
+        # happened, so cache hits and peak surcharges are already baked in
+        # (an 89% hit rate makes a dollar buy more tokens, hence more waste).
+        # Cache STORAGE is deliberately excluded from the denominator -- those
+        # dollars bought no tokens, so counting them would flatter the
+        # provider that leaks storage. None where there is no per-token price
+        # (cost_mode "local"/"plan", or simply nothing billed yet): the ratio
+        # is undefined there, not zero.
+        for r in rows:
+            r["per_dollar"] = (r["co2"] / r["cost"]) if r["cost"] > 0 else None
 
         grand_total = sum(r["cost"] for r in rows)
         storage_total = sum(r["storage"] for r in rows)
@@ -2917,25 +2994,57 @@ class ConversationManager:
             # gets its own line rather than being inferred from the table.
             intensity_rank = sorted(rows, key=lambda r: r["intensity"])
             lines.append(
-                "\u2696\uFE0F **Per Mtok** (volume-free; table above = "
-                "volume \u00d7 this): " + " \u00b7 ".join(
+                "\u2696\uFE0F **Per Mtok** (volume-free): " + " \u00b7 ".join(
                     "{} {:,.0f} g".format(r["p"].name, r["intensity"])
                     for r in intensity_rank))
+            # Lowest first, because the question is "what is the least
+            # waste a dollar can make", and omitting the undefined rows beats
+            # printing a 0 that reads as "perfectly clean".
+            priced = [r for r in rows if r["per_dollar"] is not None]
+            if priced:
+                def gpd(v):
+                    if v >= 1000:
+                        return "{:,.1f}k".format(v / 1000)
+                    return "{:,.0f}".format(v) if v >= 1 else "<1"
+                lines.append(
+                    "\U0001F4B5 **Per $** (lower better): " + " \u00b7 ".join(
+                        "{} {}".format(r["p"].name, gpd(r["per_dollar"]))
+                        for r in sorted(priced, key=lambda r: r["per_dollar"]))
+                    + " g")
             lines.append(
-                "   _Order-of-magnitude: per-provider grid, non-reasoning "
-                "baseline, tailpipe-only car. Grids are location-based, "
-                "NOT REC-adjusted. Tune in .env._")
+                "   _Order-of-magnitude: grid per provider, non-reasoning "
+                "baseline, location-based (not REC-adjusted). Tune in .env._")
         if AMORTIZE_TRAINING and train_co2_g_total > 0:
-            t_equiv = _co2_equivalents(train_co2_g_total)
-            short = ""
-            if t_equiv:
-                short = " (" + t_equiv.split(", or")[0].replace(
-                    "about the same as driving ", "") + ")"
+            # No everyday equivalent here on purpose: the carbon line above
+            # already anchors the reader, and repeating it would spend ~35 of
+            # the ~90 characters of headroom this message has left.
             lines.append(
-                "   **+ amortized training**: ~ {} CO2e{} over a ~{:.0f}T-token "
+                "   **+ amortized training**: ~ {} CO2e over a ~{:.0f}T-token "
                 "lifespan — squishiest estimate here; AMORTIZE_TRAINING=0 to "
-                "hide.".format(mass(train_co2_g_total), short,
+                "hide.".format(mass(train_co2_g_total),
                                MODEL_LIFETIME_TOKENS / 1e12))
+
+        # Who chose what got billed. The rankings above are volume x intensity
+        # and say nothing about whether anyone MEANT to send that volume -- a
+        # head the router keeps picking is a routing decision to revisit, while
+        # the same tokens chosen by hand are just what you wanted. Shares are
+        # of the ATTRIBUTED subset: tokens billed before this counter existed
+        # are reported as unattributed rather than silently folded into "auto".
+        attributed = {}
+        for r in rows:
+            for m, n in (r["p"].total_tokens_by_selection or {}).items():
+                attributed[m] = attributed.get(m, 0) + n
+        attr_total = sum(attributed.values())
+        if attr_total > 0:
+            parts = " \u00b7 ".join(
+                "{} {:.0f}%".format(SELECTION_LABELS.get(m, m),
+                                    attributed[m] / attr_total * 100)
+                for m in SELECTION_MODES if attributed.get(m))
+            all_tokens = sum(r["in"] + r["cached"] + r["out"] for r in rows)
+            unattributed = max(0, all_tokens - attr_total)
+            tail = (" \u00b7 {} unattributed".format(_compact_tokens(unattributed))
+                    if unattributed else "")
+            lines.append("\U0001F3B2 **Chosen by**: " + parts + tail)
 
         # Discord REJECTS a message over 2,000 chars outright, and the
         # 7-head case with peak surcharges, tool-call clauses and plan
@@ -2979,7 +3088,7 @@ class ConversationManager:
             grid = (p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
                     else GRID_GCO2_PER_KWH)
             lines.append(
-                "  **{}**: {} requests, {:,} in + {:,} out{} = {} "
+                "  **{}**: {} req, {:,} in + {:,} out{} = {} "
                 "\u00b7 {:.1f} Wh, {} CO2e (grid ~ {:.0f})".format(
                     p.name, p.total_requests, r["in"], r["out"], cache_note,
                     cost_str, r["energy"], mass(r["co2"]), grid))
@@ -4244,8 +4353,13 @@ Return one JSON object only:
         # Select which model responds (forced or auto)
         if forced_provider:
             provider = forced_provider
+            # A bare prefix (!claude, !dummy, ...) is the clearest override
+            # there is: the user named the head for this single turn.
+            _SELECTION_MODE.set("override")
         else:
-            provider, routing_reason = await self._select_model(message, message.guild.id)
+            provider, routing_reason, selection_mode = await self._select_model(
+                message, message.guild.id)
+            _SELECTION_MODE.set(selection_mode)
         if participation.unsolicited:
             routing_reason = (
                 routing_reason + f" Ambient participation approved ({participation.reason})."
@@ -5939,13 +6053,22 @@ Return one JSON object only:
         Lower = cheaper = preferred when scores are tied."""
         return (provider.input_cost_per_million + provider.output_cost_per_million) / 2
 
-    async def _select_model(self, message: discord.Message, guild_id: int) -> tuple[ModelProvider, str]:
+    async def _select_model(
+        self, message: discord.Message, guild_id: int,
+    ) -> tuple[ModelProvider, str, str]:
         """Select which model should respond to this message.
-        Returns (provider, routing_reason) tuple."""
+
+        Returns (provider, routing_reason, selection_mode). The third element
+        feeds _SELECTION_MODE / !cost and says WHO decided: "auto" when the
+        confidence heuristic picked (or when there was nothing to pick from),
+        "override" when a human pinned it -- a !prefer channel preference or
+        the operator's config default_model. A bare !claude-style prefix never
+        reaches here; its caller sets "override" directly."""
         enabled = [p for p in self.providers if p.enabled]
         if not enabled:
             # Shouldn't happen — on_message gates earlier — but fail gracefully.
-            return self.claude_provider, "No providers enabled; defaulting to Claude."
+            return (self.claude_provider,
+                    "No providers enabled; defaulting to Claude.", "auto")
 
         # Hard rule: images require a vision-capable provider. Filter the pool
         # down to vision-capable providers and let normal scoring pick among them.
@@ -5976,7 +6099,10 @@ Return one JSON object only:
         # len>1 here and the auto_pool filter below keeps sim out of the argmax.
         if len(enabled) == 1:
             only = enabled[0]
-            return only, f"Only {only.name} is available{vision_routing_note}."
+            # Nobody chose this: it is the only head up. "auto" is the
+            # honest bucket -- calling it an override would credit the user
+            # with a decision they never made.
+            return only, f"Only {only.name} is available{vision_routing_note}.", "auto"
 
         # User preference for this channel?
         channel_id = message.channel.id
@@ -5988,12 +6114,18 @@ Return one JSON object only:
         pref_map = {p.id: p for p in self.providers}
         if pref in pref_map and pref_map[pref] in enabled:
             chosen = pref_map[pref]
-            return chosen, f"User set channel preference to {chosen.name} (!prefer {pref}).{vision_routing_note}"
+            return (chosen,
+                    f"User set channel preference to {chosen.name} "
+                    f"(!prefer {pref}).{vision_routing_note}", "override")
 
         # Global default override?
         if CONFIG.default_model in pref_map and pref_map[CONFIG.default_model] in enabled:
             chosen = pref_map[CONFIG.default_model]
-            return chosen, f"Global default model is set to {chosen.name}.{vision_routing_note}"
+            # An operator pinning default_model is a human decision too, so
+            # it bills as an override rather than as the router's work.
+            return (chosen,
+                    f"Global default model is set to "
+                    f"{chosen.name}.{vision_routing_note}", "override")
 
         # Auto-select via confidence heuristic — three-way argmax with a
         # cost-based tiebreak (cheaper wins ties). The scoring functions
@@ -6018,7 +6150,7 @@ Return one JSON object only:
             f"Auto-routed by heuristic: {score_str}. {winner.name} wins "
             f"(cost-based tiebreak applies on ties).{vision_routing_note}"
         )
-        return winner, reason
+        return winner, reason, "auto"
 
     async def _generate_openai_compatible_response(
         self,
@@ -7347,7 +7479,23 @@ Return one JSON object only:
         except anthropic.APIError as e:
             return f"Claude Error: {e}", [], ""
 
-    async def _panel_complete(
+    async def _panel_complete(self, *args, **kwargs) -> str:
+        """Bill a panel/judge/recap call as machinery, then run it.
+
+        These are not model CHOICES -- nobody picked the panel's membership
+        per turn -- so they must not land in the user's or the router's
+        bucket. The wrapper exists because !research and the bookclub recap
+        are reached from inside a chat turn that has already set its own mode,
+        so the default is not enough here; reset() in the finally keeps the
+        chat turn's own attribution intact for anything it bills afterwards.
+        """
+        tok = _SELECTION_MODE.set("system")
+        try:
+            return await self._panel_complete_dispatch(*args, **kwargs)
+        finally:
+            _SELECTION_MODE.reset(tok)
+
+    async def _panel_complete_dispatch(
         self,
         provider: ModelProvider,
         guild_id: int,

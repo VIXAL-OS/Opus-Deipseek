@@ -3,6 +3,8 @@ memories.json
 __pycache__/
 config.json
 config.json.tmp
+# Timestamped state backups taken before a restart (memories.json.bak-20261107-175920 etc.)
+*.bak-*
 .claude/
 .venv/
 venv/

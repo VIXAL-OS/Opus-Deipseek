@@ -93,7 +93,7 @@ check("and never a bare 0% that reads as nothing",
 
 print("\nnothing from the old format was dropped")
 check("per-provider detail still lists requests and tokens",
-      "**Detail**" in out and "requests," in out)
+      "**Detail**" in out and " req, " in out)
 check("cache hit rate survives", "% hit)" in out)
 check("the grand total survives", "**Total**" in out)
 gem = provider(bot.GEMINI_PROVIDER, 23, 607_675, 12_909, 1_458_757, storage=11.78)
@@ -132,7 +132,7 @@ check("Deepseek precedes Claude per token, the reverse of the CO2e column",
 m3 = [l for l in mgr().get_cost_summary([claude, deep, tiny]).splitlines()
       if "Per Mtok" in l][0]
 check("Mistral ranks first per token despite being last cumulatively",
-      m3.split("this): ")[1].startswith("Mistral"))
+      m3.split("(volume-free): ")[1].startswith("Mistral"))
 cl = copy.deepcopy(bot.CLAUDE_PROVIDER)
 ds = copy.deepcopy(bot.DEEPSEEK_PROVIDER)
 check("intensity is just Wh/1k x grid (Claude 0.6 x 400 = 240 g/Mtok)",
@@ -142,6 +142,91 @@ check("and is independent of traffic (same figure at 10x the tokens)",
       and "Claude 240 g" in mgr().get_cost_summary(
           [provider(bot.CLAUDE_PROVIDER, 1220, 47_288_840, 1_444_060),
            provider(bot.DEEPSEEK_PROVIDER, 4, 2_000, 100)]))
+
+print("\nthe per-dollar ranking (2026-11-07)")
+# The dual of per-Mtok: that one is the metric when the WORK is fixed, this one
+# when the BUDGET is. They disagree because a dollar buys wildly different
+# token counts, so a cheap head on a dirty grid is the worst thing to spend a
+# dollar on while being among the cleanest things to send a token to.
+pd = [l for l in out.splitlines() if "Per $" in l][0]
+check("the per-dollar line is present", bool(pd))
+check("it says which direction is good", "lower better" in pd)
+check("Claude is better per dollar than Deepseek, inverting per-Mtok",
+      pd.index("Claude") < pd.index("Deepseek")
+      and mtok.index("Deepseek") < mtok.index("Claude"))
+# Needs three providers to show: with two, several orderings coincide.
+three = mgr().get_cost_summary([claude, deep, tiny])
+
+
+def _order(line, lead):
+    body = line.split(lead)[1]
+    return [w for w in body.replace("·", " ").split()
+            if w in ("Claude", "Deepseek", "Mistral")]
+
+
+t_cost = [r[:26].strip().split()[1]
+          for r in three.split("```")[1].strip().splitlines()[1:] if r.strip()]
+t_mtok = _order([l for l in three.splitlines() if "Per Mtok" in l][0],
+                "(volume-free): ")
+t_pd = _order([l for l in three.splitlines() if "Per $" in l][0],
+              "(lower better): ")
+check("per-$ is a THIRD ordering, matching neither cost nor per-Mtok",
+      len(t_pd) == 3 and t_pd != t_cost and t_pd != t_mtok)
+check("concretely: cheapest-per-dollar is Mistral, dirtiest is Deepseek",
+      t_pd[0] == "Mistral" and t_pd[-1] == "Deepseek")
+check("while the cost column still leads with Claude", t_cost[0] == "Claude")
+
+# Realised, not rate-card: cache hits make a dollar buy MORE tokens, so a
+# heavier hit rate is worse per dollar on the same grid and the same rates.
+cold = provider(bot.DEEPSEEK_PROVIDER, 10, 1_000_000, 10_000)
+warm = provider(bot.DEEPSEEK_PROVIDER, 10, 100_000, 10_000, cached=900_000)
+cold_pd = [l for l in mgr().get_cost_summary([cold]).splitlines()
+           if "Per $" in l][0]
+warm_pd = [l for l in mgr().get_cost_summary([warm]).splitlines()
+           if "Per $" in l][0]
+
+
+def _num(line):
+    v = line.split("Deepseek")[1].split("g")[0].strip()
+    return float(v[:-1]) * 1000 if v.endswith("k") else float(v.replace(",", ""))
+
+
+check("a cache-heavy provider is WORSE per dollar than a cold one",
+      _num(warm_pd) > _num(cold_pd))
+
+# Cache STORAGE bought no tokens, so it must not flatter the denominator.
+nostore = provider(bot.GEMINI_PROVIDER, 23, 607_675, 12_909, 1_458_757)
+withstore = provider(bot.GEMINI_PROVIDER, 23, 607_675, 12_909, 1_458_757,
+                     storage=11.78)
+g1 = [l for l in mgr().get_cost_summary([nostore]).splitlines()
+      if "Per $" in l][0]
+g2 = [l for l in mgr().get_cost_summary([withstore]).splitlines()
+      if "Per $" in l][0]
+check("cache storage is excluded from the per-dollar denominator", g1 == g2)
+
+# Undefined, not zero, where there is no per-token price.
+loc2 = provider(bot.DEEPSEEK_PROVIDER, 5, 100_000, 5_000)
+loc2.cost_mode = "local"
+lout = mgr().get_cost_summary([loc2])
+check("a local backend is omitted rather than shown as perfectly clean",
+      "Per $" not in lout)
+pl2 = provider(bot.QWEN_PROVIDER, 5, 100_000, 5_000)
+pl2.cost_mode, pl2.plan_monthly_usd = "plan", 3.0
+check("so is a prepaid plan (its tokens cost no marginal dollar)",
+      "Per $" not in mgr().get_cost_summary([pl2]))
+check("but a priced provider alongside them still ranks",
+      "Per $" in mgr().get_cost_summary([loc2, claude]))
+
+# Formatting: the spread runs from single digits to thousands.
+big = provider(bot.DEEPSEEK_PROVIDER, 500, 6_000_000, 170_000, 48_000_000)
+check("a four-figure ratio renders compactly as 'k'",
+      "k g" in [l for l in mgr().get_cost_summary([big]).splitlines()
+                if "Per $" in l][0])
+clean = provider(bot.MISTRAL_PROVIDER, 500, 5_000_000, 200_000)
+cl_pd = [l for l in mgr().get_cost_summary([clean]).splitlines()
+         if "Per $" in l][0]
+check("and a sub-gram ratio reads '<1', never '0'",
+      ("<1" in cl_pd) or (" 0 g" not in cl_pd))
 
 print("\ngrid constants are location-based, not REC-adjusted (2026-11-07)")
 check("Claude sits at the US average, not the old REC-justified 250",

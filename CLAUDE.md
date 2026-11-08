@@ -95,6 +95,13 @@ self-contained — you don't need it to pick up the remaining work below.
   an explicit `cache_control`, so `_generate_claude_response(cache_system=True)` marks the stable
   prefix; the panel/judge pass `cache_system=False` because a one-shot prompt pays the cache-WRITE
   premium ($5/M) and is never read back. Guarded by `scratchpad/test_prompt_cache_order.py`.
+- **Routing attribution rides a ContextVar, not a parameter.** `_SELECTION_MODE` (just after
+  `GRID_GCO2_PER_KWH`) carries who chose the model for the turn being billed; `record_usage` reads
+  it. It defaults to `"system"`, so a NEW utility call path needs no change — but a new **chat**
+  path MUST `_SELECTION_MODE.set(...)`, or its turns bill as machinery. Anything reached from
+  inside a chat turn that is not itself a model choice must `set` **and `reset`** (see
+  `_panel_complete`), because a bare `set` leaks for the remainder of that Task. Guarded by
+  `scratchpad/test_selection_attribution.py`.
 - **Model slugs drift** — verify in the live libraries (Fireworks retires serverless models on
   ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
   Alibaba `qwen3.8-flash` (live on `dashscope-us` 2026-09-21), Fireworks `glm-5p3` + the `qwen3p8-max` /
@@ -146,6 +153,81 @@ byte-for-byte the old behavior):
 ---
 
 ## Status — 2026-11-07
+
+### ✅ `!cost` gained a per-dollar ranking — the third ordering (2026-11-07)
+Sarah: *"some kind of co2e/$ metric, where lower is better — if i'm going to spend a dollar on
+tokens, what's the lowest waste i will make for it?"* It is the **dual** of the per-Mtok line, and
+it ranks the fleet differently again:
+**`💵 Per $ (lower better): Mistral 12 · Gemini 64 · Claude 77 · Kimi 108 · Qwen 660 ·
+Deepseek 5.3k g`** — i.e. **a dollar spent on DeepSeek makes ~69× the emissions of a dollar spent
+on Claude**, because a dollar buys ~29M DeepSeek tokens (at an 89% cache-hit rate) on a 550 g/kWh
+grid, against a few hundred thousand Claude tokens on a 400 g/kWh one.
+- **Per-Mtok and per-$ are duals, and which one is right depends on your binding constraint.**
+  Per-Mtok is the metric when the WORK is fixed and you want the least emissions per unit of work;
+  per-$ is the metric when the BUDGET is fixed and you want the least emissions per unit of spend.
+  That is why they can rank in opposite directions without either being wrong: a cheap head on a
+  dirty grid is simultaneously among the cleanest things to send a token to and the worst thing to
+  spend a dollar on. Taken *alone* per-$ would say "buy the priciest model", which is only rational
+  under a fixed budget — so it ships beside per-Mtok, never instead of it.
+- **Realised, not rate-card.** Computed as `co2 / cost` from what actually happened, so cache hits
+  and peak surcharges are already in it; a heavier hit rate makes a dollar buy *more* tokens and
+  therefore *more* waste, which the harness pins directly (a cache-warm provider scores worse than
+  an otherwise identical cold one).
+- **Cache storage is excluded from the denominator** on purpose: those dollars bought no tokens, so
+  counting them would flatter whichever provider leaks storage — exactly backwards.
+- **Undefined, not zero**, where there is no per-token price: `cost_mode="local"`/`"plan"` rows are
+  omitted from the ranking rather than rendered as perfectly clean. Sub-1 reads `<1`, four figures
+  read `5.3k`.
+- **Paid for in characters**, since the 7-head worst case had only ~60 left: the `Per Mtok` label
+  lost its explanatory parenthetical, the order-of-magnitude caveat was trimmed, and Detail's
+  "requests" became "req". Worst case is now **1,895/2,000** with Detail intact.
+- Offline-validated: `scratchpad/test_cost_summary_format.py` 36 → **49/49** (the three-way
+  ordering divergence driven on real figures, cache-warm vs cold, storage exclusion, local/plan
+  omission, and both number formats).
+
+### ✅ `!cost` now says WHO chose the model (2026-11-07)
+Direct follow-up to the carbon correction below. The rankings are *volume × intensity* and say
+nothing about whether anyone MEANT to send that volume — a head the router keeps picking is a
+routing decision to revisit, while the same tokens chosen by hand are just what you wanted. New
+line: **`🎲 Chosen by: auto 65% · yours 24% · machinery 11% · 61.5M unattributed`**.
+- **Three buckets, named for who decided.** `auto` = the confidence heuristic's argmax, *and* the
+  only-head-up case (nobody chose it, so crediting the user with a decision they never made would
+  be wrong); `override` = a human pinned it — a bare `!claude`-style prefix, a `!prefer` channel
+  pin, or the operator's `config.default_model`; `system` = not a model choice at all (panel
+  members, the judge, bookclub recaps, `!summarize`, G2P, the participation classifier).
+- **A ContextVar, NOT a threaded parameter** — which answers Sarah's earlier question about
+  threading directly. `record_usage` has **11 call sites across five dispatch paths**, and the tool
+  loop calls it several times inside ONE logical request, so threading would have touched all of
+  them. `contextvars.ContextVar` is read inside `record_usage` instead, and asyncio gives each
+  Discord event its own Task — a child Task gets a **copy** of the context — so it is exact under
+  concurrent turns at zero churn at those sites. Default `"system"`, so every utility call bills as
+  machinery without opting in. The one place that must force it back is **`_panel_complete`**,
+  which is reached from inside a chat turn that has already set its own mode; it is now a thin
+  `set`/`try`/`reset` wrapper around `_panel_complete_dispatch` (the old body — callers unchanged),
+  and the `reset` is load-bearing: without it a `!research` would silently re-label the rest of its
+  own chat turn as machinery.
+- **Tokens, not requests.** `total_requests` is bumped at the call sites, where one logical request
+  can record usage several times (tool loop, degraded retry), so a per-mode request counter would
+  over-count. Tokens are also what both dollars and carbon follow. The figure is uncached + cached
+  + output.
+- **Legacy saves are reported, not guessed.** `tokens_by_selection` is absent from every save made
+  before today, so the buckets sum to *less* than the token totals — the gap renders as
+  `61.5M unattributed` instead of being folded into `auto`, shares are of the attributed subset,
+  and the whole line is omitted while nothing is attributed. `load_stats` copies the dict rather
+  than aliasing the saved one.
+- **Char budget:** the line costs ~55–75 chars and the 7-head worst case is now **1,929** against
+  Discord's 2,000. Paid for by dropping the duplicate everyday-equivalent from the
+  amortized-training line (the carbon line above already anchors the reader). The 1,990 guard still
+  catches the overflow case.
+- Offline-validated: new `scratchpad/test_selection_attribution.py` (**34/34** — bucket mechanics,
+  unknown-mode rejection, the tool-loop multi-call case, two interleaved asyncio turns keeping
+  separate buckets, a child task not leaking back to its parent, the panel wrapper's reset, a
+  persistence round trip incl. a pre-2026-11-07 save and a dict-aliasing check, all four
+  `_select_model` branches driven through the real method, and the display's honesty about
+  unattributed history). Full suite green; syntax + import gates pass.
+- ⚠️ **Not ported to ISAIC**, which still has the registry-ordered `!cost`.
+- ⚠️ **Owes one live check**: two real Discord turns — one plain (auto) and one `!claude`
+  (override) — then `!cost`, to confirm the buckets fill as expected on the live wiring.
 
 ### ✅ Carbon constants corrected + a volume-free per-token ranking (2026-11-07)
 Sarah pushed back on the headline from the `!cost` rewrite — *"i thought china had a lot of
