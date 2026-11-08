@@ -295,7 +295,12 @@ for c in (bot.CLAUDE_PROVIDER, bot.DEEPSEEK_PROVIDER, bot.GEMINI_PROVIDER,
 full = mgr().get_cost_summary(every)
 check(f"7 heads with attribution render in {len(full)} chars (< 2000)",
       len(full) < 2000)
-check("and Detail still survives at that size", "**Detail**" in full)
+check("and the attribution line survives at that size",
+      "Chosen by" in full)
+# Per-provider detail left !cost for !costdetail on 2026-11-08, so what
+# "survives at that size" now means is the pointer, not the section.
+check("per-provider detail is no longer part of the summary",
+      "**Detail**" not in full and "`!costdetail`" in full)
 
 print(f"\n{ok} passed, {fail} failed")
 sys.exit(1 if fail else 0)

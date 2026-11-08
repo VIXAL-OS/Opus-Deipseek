@@ -107,7 +107,15 @@ print("\nlocal mode is untouched by the change")
 loc = sample("local")
 check("local still reports no per-token $", loc.get_cost() == 0.0)
 check("local still reports energy", loc.get_energy_wh() > 0)
-check("!cost still labels local electricity-only", "electricity only" in summary_src)
+# The per-provider rows moved to !costdetail on 2026-11-08, so the
+# electricity-only label lives in that method now. Assert the source was
+# actually found, so a future rename fails loudly instead of passing on
+# an empty search.
+detail_src = __import__("inspect").getsource(
+    bot.ConversationManager.get_cost_detail)
+check("the detail method was found at all", len(detail_src) > 500)
+check("!costdetail still labels local electricity-only",
+      "electricity only" in detail_src)
 
 print("\nconfig wiring (fresh interpreter each)")
 out = in_subprocess("""

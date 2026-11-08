@@ -74,14 +74,26 @@ check("both columns are present with a header",
 
 print("\ncarbon equivalents")
 check("the carbon line carries a driving equivalent",
-      "petrol car" in out)
+      "gasoline car" in out)
 check("and a gaming equivalent", "PC gaming" in out)
 check("and says plainly that it is order-of-magnitude",
       "Order-of-magnitude" in out)
 check("equivalents helper returns '' for a negligible mass",
       bot._co2_equivalents(0.4) == "")
-check("1 kg of CO2e is ~4 km of driving at 250 g/km",
-      "4 km" in bot._co2_equivalents(1000.0))
+# US units for the car (Sarah's call, 2026-11-08): the constant is now the
+# EPA's own per-MILE figure rather than a g/km conversion of it, so there is
+# one less unit hop between the source and the line.
+check("the car equivalent is in miles, not km",
+      " miles" in bot._co2_equivalents(1000.0)
+      and " km" not in bot._co2_equivalents(1000.0))
+check("and the constant IS the EPA per-mile figure",
+      bot.CO2_G_PER_MILE_GAS_CAR == 400.0)
+check("one mile is singular, never '1 miles'",
+      "1 mile " in bot._co2_equivalents(400.0))
+check("a sub-mile mass reads in feet, not a decimal fraction of a mile",
+      "ft" in bot._co2_equivalents(100.0))
+check("only the car went imperial - energy and mass stay metric",
+      "kWh" in out and "CO2e" in out)
 check("a small mass falls back to minutes of gaming, not '0 h'",
       "min" in bot._co2_equivalents(50.0))
 
@@ -93,18 +105,27 @@ check("and never a bare 0% that reads as nothing",
       " 0%" not in out2.split("```")[1])
 
 print("\nnothing from the old format was dropped")
-check("per-provider detail still lists requests and tokens",
-      "**Detail**" in out and " req, " in out)
-check("cache hit rate survives", "% hit)" in out)
+# Per-provider detail moved to !costdetail (2026-11-08) instead of being
+# trimmed out of a summary that could no longer hold it beside the rankings.
+dt = mgr().get_cost_detail([claude, deep])
+check("!cost no longer carries a Detail section", "**Detail**" not in out)
+check("and it points at the command that does", "`!costdetail`" in out)
+check("per-provider detail lists requests and tokens",
+      "requests," in dt and " in + " in dt)
+check("cache hit rate survives", "% hit)" in dt)
+check("every provider is listed, detail having a message of its own",
+      dt.count("\n  **") == 2)
 check("the grand total survives", "**Total**" in out)
 gem = provider(bot.GEMINI_PROVIDER, 23, 607_675, 12_909, 1_458_757, storage=11.78)
 out3 = mgr().get_cost_summary([gem])
 check("Gemini cache storage still itemised",
       "cache storage" in out3 and "11.78" in out3)
+check("and its per-provider sub-line survives in the detail command",
+      "per token-hour" in mgr().get_cost_detail([gem]))
 loc = provider(bot.DEEPSEEK_PROVIDER, 5, 1000, 100)
 loc.cost_mode = "local"
 check("local backends still say electricity only",
-      "electricity only" in mgr().get_cost_summary([loc]))
+      "electricity only" in mgr().get_cost_detail([loc]))
 plan = provider(bot.QWEN_PROVIDER, 5, 1000, 100)
 plan.cost_mode, plan.plan_monthly_usd = "plan", 3.0
 pout = mgr().get_cost_summary([plan])
@@ -113,7 +134,7 @@ check("prepaid plans still footer below the total",
 tool = provider(bot.DEEPSEEK_PROVIDER, 5, 1000, 100)
 tool.record_tool_requests(search=1000)
 check("per-request tool spend still itemised",
-      "tool calls" in mgr().get_cost_summary([tool]))
+      "tool calls" in mgr().get_cost_detail([tool]))
 
 print("\nthe volume-free per-Mtok ranking (2026-11-07)")
 # The cumulative CO2e column is volume x intensity, and volume is a routing
@@ -240,7 +261,7 @@ check("per token Claude is DIRTIER than Deepseek, the fleet's cheap head",
 
 print("\nDetail never renders a mass as a bare '0 g'")
 fr = provider(bot.MISTRAL_PROVIDER, 1, 500, 20)
-dout = mgr().get_cost_summary([fr]).split("**Detail**")[1]
+dout = mgr().get_cost_detail([fr])
 check("a sub-gram provider reads '<1 g', not '0 g'",
       "<1 g" in dout and "0 g CO2e" not in dout)
 
@@ -258,12 +279,11 @@ heavy[4].cost_mode, heavy[4].plan_monthly_usd = "plan", 3.0
 hout = mgr().get_cost_summary(heavy)
 check(f"the worst case is held under the limit ({len(hout)} chars)",
       len(hout) < 2000)
-check("and it is Detail that gave way, not the rankings",
-      "omitted" in hout and "by cost" in hout and "Per Mtok" in hout)
-check("some Detail still survives rather than all of it vanishing",
-      hout.count("\n  **") > 0)
-check("an ordinary summary is NOT truncated",
-      "omitted" not in out and "**Detail**" in out)
+check("the rankings and every carbon line survive",
+      "by cost" in hout and "Per Mtok" in hout and "Per $" in hout)
+check("and with Detail gone, nothing has to be truncated at all",
+      "omitted" not in hout
+      and "\u2026" not in hout.rsplit("```", 1)[1])
 
 print("\nthe live 8-provider fleet (2026-11-08)")
 # The real fleet is 7 heads PLUS the Haiku participation gate, whose name is
@@ -298,19 +318,32 @@ check("and the full name still appears in the prose rankings",
       "Haiku participation gate" in
       [l for l in eight.splitlines() if "Per Mtok" in l][0])
 
-print("\nDetail degrades gracefully instead of vanishing")
-kept = [l for l in eight.splitlines() if l.startswith("  **")]
-check("some per-provider detail survives", len(kept) > 0)
-check("it is the highest-spend providers that are kept",
-      kept[0].startswith("  **Claude**"))
-note = [l for l in eight.splitlines() if "more provider line(s) omitted" in l]
-check("and the omission is declared", len(note) == 1)
-# No cache storage in this fixture, so one detail line == one provider.
-claimed = int(re.search(r"\((\d+) more", note[0]).group(1))
-check("the declared count matches what was actually dropped",
-      claimed == len(fleet) - eight.count("\n  **"))
-check("and nothing was dropped silently",
-      claimed > 0 and eight.count("\n  **") + claimed == len(fleet))
+print("\nthe whole fleet's detail fits in its own command")
+# This section used to pin that Detail degraded GRACEFULLY inside !cost,
+# because 8 providers could not fit. It no longer lives there: !costdetail
+# has a message of its own and is sent through the chunking path, so every
+# provider is listed in full and nothing is declared omitted.
+eight_dt = mgr().get_cost_detail(fleet)
+kept = [l for l in eight_dt.splitlines() if l.startswith("  **")]
+check("all 8 providers are listed, none omitted", len(kept) == 8)
+check("ordered by spend, highest first", kept[0].startswith("  **Claude**"))
+check("nothing is declared dropped", "omitted" not in eight_dt)
+check("the gate's full 24-char name survives where width is free",
+      "**Haiku participation gate**" in eight_dt)
+check("and !cost is well clear of the limit now that detail left",
+      len(eight) < 1600)
+
+print("\n!costdetail can answer about a single head")
+one = mgr().get_cost_detail(fleet, only=gate)
+check("only the asked-for provider is listed", one.count("\n  **") == 1)
+check("and it is the right one", "Haiku participation gate" in one)
+check("the header does not repeat the name the row already carries",
+      "Cost detail**" in one.splitlines()[0])
+check("a head that never billed says so instead of rendering $0.0000",
+      "nothing billed yet" in mgr().get_cost_detail(
+          fleet, only=provider(bot.KIMI_PROVIDER, 0, 0, 0)))
+check("and an empty fleet still gives the short message",
+      mgr().get_cost_detail([]) == "\U0001F4B0 No API calls made yet.")
 
 print("\neven a pathological fleet cannot exceed the limit")
 many = []
@@ -321,6 +354,8 @@ for i in range(20):
 huge = mgr().get_cost_summary(many)
 check(f"20 providers still fit ({len(huge)} chars)", len(huge) <= 2000)
 check("and the rankings survive even then", "by cost" in huge)
+check("the ranked lists declare what they could not fit, not a word-cut",
+      "more" in [l for l in huge.splitlines() if "Per Mtok" in l][0])
 
 print("\nDiscord markdown cannot eat an identifier")
 # A bare underscore is an italics delimiter, and AMORTIZE_TRAINING's paired
@@ -330,6 +365,27 @@ amort = [l for l in out.splitlines() if "amortized training" in l]
 if amort:
     check("AMORTIZE_TRAINING is inside a code span",
           "`AMORTIZE_TRAINING=0`" in amort[0])
+
+print("\nno emphasis marker can run past its own line")
+# A bare underscore is an italics delimiter on Discord and pairs with the
+# NEXT one anywhere in the message, lines later included: AMORTIZE_TRAINING's
+# underscore ate the omission note's opening marker, printing
+# "AMORTIZETRAINING" and leaving an orphaned "_" at the end of the message.
+# So the invariant worth pinning is not "backtick that one identifier" but
+# "every emphasis marker outside a code span is balanced", over everything
+# these two commands emit.
+def emphasis_balanced(text):
+    t = re.sub(r"```.*?```", "", text, flags=re.S)   # fenced blocks
+    t = re.sub(r"`[^`]*`", "", t)                    # inline code spans
+    return (t.count("**") % 2 == 0
+            and t.replace("**", "").count("_") % 2 == 0)
+
+for label, txt in (("!cost", out), ("!cost with 8 heads", eight),
+                   ("!cost worst case", hout), ("!cost with 20 heads", huge),
+                   ("!costdetail", eight_dt), ("!costdetail <head>", one)):
+    check("emphasis is balanced in " + label, emphasis_balanced(txt))
+check("and the check is not a tautology - it catches the real bug",
+      not emphasis_balanced("AMORTIZE_TRAINING=0\n  _(a note)_"))
 
 print("\nit still fits a Discord message")
 every = [provider(c, 50, 500_000, 20_000, 100_000) for c in (

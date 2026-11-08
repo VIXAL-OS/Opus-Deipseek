@@ -110,6 +110,13 @@ self-contained — you don't need it to pick up the remaining work below.
   rely on `_strip_images_from_messages`: that one only fires for `supports_vision=False` providers,
   which is exactly why enabling Deepseek vision exposed this. Guarded by
   `scratchpad/test_assistant_images.py`.
+- **Anything printed to Discord must keep its emphasis markers balanced.** A bare `_` is an
+  italics delimiter and pairs with the NEXT one anywhere in the message — lines later included
+  — so an identifier like `AMORTIZE_TRAINING` opens a run that swallows everything up to the
+  next `_` (live, it ate the omission note's opening marker and orphaned its closing one). Put any
+  identifier in a code span, and NEVER truncate a message at a character position: drop whole
+  lines, which are individually balanced, and re-close any code fence the trim landed inside.
+  Guarded by the emphasis check in `scratchpad/test_cost_summary_format.py`.
 - **Model slugs drift** — verify in the live libraries (Fireworks retires serverless models on
   ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
   Alibaba `qwen3.8-flash` (live on `dashscope-us` 2026-09-21), Fireworks `glm-5p3` + the `qwen3p8-max` /
@@ -161,6 +168,60 @@ byte-for-byte the old behavior):
 ---
 
 ## Status — 2026-11-08
+
+### ✅ `!cost` split: per-provider detail is now `!costdetail` (2026-11-08)
+Sarah, on the live 8-provider summary: *"can you check whether the italics are where they're
+supposed to be for this message? also can we make a separate command for per-provider cost lol"*
+— and then *"convert the 31 km figure to miles, and say gasoline instead of petrol. We're
+americans. the other measurements can stay metric."*
+- **The italics answer: wrong in that message, already fixed in the running bot.** The paste was
+  timestamped **9:44**; the bot restarted at **9:51:09** onto the commit that fixed it (09:50:45),
+  so the live head already emits the corrected form — confirmed by rendering the summary and
+  counting delimiters. The mechanism, visible in the paste itself: `AMORTIZE_TRAINING`'s bare `_`
+  opened an italic run that closed on **the omission note's opening `_`, two lines later**, so
+  everything between them rendered italic, `AMORTIZETRAINING` lost its underscore, and the note's
+  trailing `_` was left orphaned — the stray `...2,000-char limit)_` at the end.
+- **The guard is now the general invariant, not a patch on one identifier.** New harness check:
+  strip fenced blocks and inline code spans, then assert the `**` and `_` counts are both EVEN,
+  over every shape these commands emit (2 / 8 / 20 heads, worst case, both detail forms). It
+  immediately caught a second instance of the same class **in my own 2,000-char backstop**: a cut
+  at character 1,987 can land between a `**` pair and bold everything after it. The backstop now
+  drops whole **lines** (each line is internally balanced) and re-closes the code fence if the trim
+  lands inside the ranking table.
+- **`!costdetail` — aliases `!breakdown` / `!detail`, optionally one head.** Detail is the
+  *precision* half of the answer and grows linearly with the fleet, while `!cost` is the *shape* of
+  the answer and has to stay one scannable message — which is exactly why it kept being
+  trimmed. `!cost` is now **1,283 chars at 8 heads** (it was 1,890 *with three providers' detail
+  already dropped*) and ends in a `📋 Breakdown: !costdetail` pointer. `!costdetail` goes
+  through `_send_response`'s chunking path, so **all 8 rows render in full** and nothing is ever
+  declared omitted; it also spells "requests" out again and keeps the gate's full 24-char name,
+  since width is no longer load-bearing there.
+- **`!costdetail <head>` resolves through the router's own alias map**, so theme aliases work
+  (`!costdetail rei` → Qwen), plus id / name / display name and an unambiguous name prefix —
+  which is the only handle the **Haiku participation gate** has, since it bills real money and has
+  no alias. A head that has never billed says so rather than rendering `$0.0000`.
+- **Row building is shared.** New `_cost_rows()` builds the rows (in-flight Gemini cache storage
+  included) for BOTH commands, so the rankings and the exact per-provider numbers can never
+  disagree about what was billed; `mass()` became module-level `_mass_co2` for the same reason.
+- **The two ranked lists are budgeted** (`fit_list`, 330 chars): they carry EVERY provider at full
+  name length, so they grow fastest with the fleet. They keep whole entries and append
+  `· +N more` instead of being cut mid-name. At 8 heads they cost ~150 chars, so this never
+  bites in practice — it exists so a growing fleet degrades legibly.
+- **US units for the car equivalent.** `CO2_G_PER_KM_PETROL_CAR` (250) →
+  **`CO2_G_PER_MILE_GAS_CAR` (400)**, which is the EPA's own per-mile figure — so the constant
+  is now the *source* value rather than a g/km conversion of it, one unit hop closer to the
+  citation. Sub-mile masses read in **feet** (`0.4 miles` would invite precision this estimate has
+  not got), one mile is singular, and "petrol" became "gasoline". **Only the car went imperial** —
+  energy stays kWh, mass stays kg/g, grid intensity stays g/kWh.
+- Offline-validated: `scratchpad/test_cost_summary_format.py` 65 → **85/85** (the emphasis
+  invariant, including a non-tautology check that it really catches the original bug; the detail
+  command's full 8-row output; single-head and never-billed branches; the budgeted lists; and every
+  unit change) and `test_selection_attribution.py` 34 → **35**. Moved checks now read
+  `get_cost_detail` rather than searching `!cost` for strings that left it.
+- **Nothing to mirror to ISAIC:** it never received the ranked `!cost`, so it has no Detail
+  section, no `_co2_equivalents` and no petrol reference to correct.
+- ⚠️ **Owes one live check:** `!cost` then `!costdetail` (and `!costdetail haiku`) in
+  Discord after a restart.
 
 ### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
 The fix above worked: the channel answered normally, Deepseek even explained its own outage. The
@@ -380,7 +441,7 @@ head, dirty grid, far more tokens. A registry-ordered list hid that completely.
   `local` electricity-only label, the prepaid-plan footer, peak surcharge and per-request tool spend
   all survive in Detail, and the harness pins each of them.
 - **Everyday carbon equivalents** on the total, because "7,199 g CO₂e" means nothing to most people:
-  `_co2_equivalents()` renders km in an average petrol car (`CO2_G_PER_KM_PETROL_CAR`, 250 g/km from
+  `_co2_equivalents()` renders km in an average petrol car (renamed to miles/gasoline 2026-11-08, see above; then `CO2_G_PER_KM_PETROL_CAR`, 250 g/km from
   the EPA's ~400 g/mile — **tailpipe only**, so it understates driving and is the conservative
   direction for a comparison that flatters us) and hours of PC gaming on a coal grid
   (`GAMING_PC_WATTS` 400 W × `COAL_GRID_GCO2_PER_KWH` 820, the IPCC AR5 lifecycle median for coal).

@@ -907,19 +907,22 @@ MODEL_LIFETIME_TOKENS = float(os.getenv("MODEL_LIFETIME_TOKENS", "1e14"))
 AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "False", "")
 
 # Everyday equivalents for the !cost carbon line. A number like "7,199 g CO₂e"
-# means nothing to most people; "29 km of driving" is a quantity you have
+# means nothing to most people; "18 miles of driving" is a quantity you have
 # intuitions about. These are ORDER-OF-MAGNITUDE anchors on an estimate that is
 # itself order-of-magnitude, so they inherit all of its error — they exist to
 # make the figure legible, never to make a claim.
-#   - Car: the US EPA's average passenger vehicle is ~400 g CO₂/mile tailpipe,
-#     i.e. ~250 g/km. Tailpipe only; fuel production and the car's own
-#     manufacture would push it higher, so this UNDERSTATES driving and is
-#     therefore the conservative direction for a comparison that flatters us.
+#   - Car: the US EPA's average passenger vehicle is ~400 g CO₂/mile tailpipe.
+#     Kept in the EPA's own per-MILE unit rather than converted to g/km, so
+#     the constant IS the source figure and the line reads in the unit the
+#     people running this bot drive in. Tailpipe only; fuel production and the
+#     car's own manufacture would push it higher, so this UNDERSTATES driving
+#     and is therefore the conservative direction for a comparison that
+#     flatters us. (Only the car is imperial — energy stays kWh and mass kg.)
 #   - Gaming: a mid-range gaming PC under load draws roughly 400 W, and the
 #     IPCC AR5 lifecycle median for coal power is ~820 g CO₂e/kWh — so ~328 g
 #     per hour on a coal-heavy grid. Chosen because it is a recognisable
 #     "screen doing compute" baseline to compare screen-doing-compute against.
-CO2_G_PER_KM_PETROL_CAR = float(os.getenv("CO2_G_PER_KM_PETROL_CAR", "250"))
+CO2_G_PER_MILE_GAS_CAR = float(os.getenv("CO2_G_PER_MILE_GAS_CAR", "400"))
 GAMING_PC_WATTS = float(os.getenv("GAMING_PC_WATTS", "400"))
 COAL_GRID_GCO2_PER_KWH = float(os.getenv("COAL_GRID_GCO2_PER_KWH", "820"))
 
@@ -933,6 +936,20 @@ def _compact_tokens(n: int) -> str:
     return str(n)
 
 
+def _mass_co2(g: float) -> str:
+    """Render a CO2e mass for display: kg above a kilo, grams below.
+
+    Module-level because !cost and !costdetail must format the same mass
+    identically -- a figure that reads "<1 g" in one place and "0 g" in the
+    other invites the reader to think the two disagree.
+    """
+    if g >= 1000:
+        return "{:,.1f} kg".format(g / 1000)
+    # "0 g" reads as "none"; "<1 g" reads as "negligible", which is what a
+    # sub-gram figure actually means.
+    return "{:,.0f} g".format(g) if g >= 0.5 else "<1 g"
+
+
 def _co2_equivalents(co2_g: float) -> str:
     """Render a CO₂e mass as everyday equivalents, or '' if too small to bother.
 
@@ -941,14 +958,19 @@ def _co2_equivalents(co2_g: float) -> str:
     """
     if co2_g < 1.0:
         return ""
-    km = co2_g / CO2_G_PER_KM_PETROL_CAR
+    miles = co2_g / CO2_G_PER_MILE_GAS_CAR
     gaming_h = co2_g / (GAMING_PC_WATTS / 1000.0 * COAL_GRID_GCO2_PER_KWH)
-    car = (f"{km:,.0f} km" if km >= 1 else f"{km * 1000:,.0f} m")
+    # Sub-mile masses read in feet rather than as a decimal fraction of a
+    # mile: "0.4 miles" invites precision this estimate cannot carry.
+    if miles >= 1:
+        car = "1 mile" if round(miles) == 1 else f"{miles:,.0f} miles"
+    else:
+        car = f"{miles * 5280:,.0f} ft"
     if gaming_h >= 1:
         game = f"{gaming_h:,.0f} h"
     else:
         game = f"{gaming_h * 60:,.0f} min"
-    return (f"about the same as driving {car} in an average petrol car, "
+    return (f"about the same as driving {car} in an average gasoline car, "
             f"or {game} of PC gaming on a coal-heavy grid")
 
 # Alternation of model display-names (provider.name values) that can show up as
@@ -2904,15 +2926,12 @@ class ConversationManager:
             f"~{est_tokens:,} tokens (~${est_cost:.3f} worst-case){material_note}"
         )
     
-    def get_cost_summary(self, providers: list[ModelProvider]) -> str:
-        """Cost + carbon summary, ranked, with everyday carbon equivalents.
+    def _cost_rows(self, providers: list[ModelProvider]) -> tuple[list[dict], float]:
+        """Per-provider cost/carbon rows, plus live Gemini cache storage.
 
-        The layout is deliberate. The old format listed providers in registry
-        order with three lines each, which buried the one genuinely surprising
-        fact: cost and carbon rank DIFFERENTLY. A cheap head on a dirty grid
-        can be 3% of the bill and 80% of the emissions, and a registry-ordered
-        list hides that completely. So the two rankings lead, side by side,
-        and the per-provider detail follows for when exact numbers are wanted.
+        Shared by !cost and !costdetail so the two can never disagree
+        about what was billed: the rankings and the exact per-provider
+        numbers are built from the same rows, in-flight storage included.
         """
         now = _utcnow()
         # Live (in-flight) Gemini cache storage. total_cache_storage_cost_est
@@ -2977,6 +2996,19 @@ class ConversationManager:
         # is undefined there, not zero.
         for r in rows:
             r["per_dollar"] = (r["co2"] / r["cost"]) if r["cost"] > 0 else None
+        return rows, gemini_live_storage
+
+    def get_cost_summary(self, providers: list[ModelProvider]) -> str:
+        """Cost + carbon summary, ranked, with everyday carbon equivalents.
+
+        The layout is deliberate. The old format listed providers in registry
+        order with three lines each, which buried the one genuinely surprising
+        fact: cost and carbon rank DIFFERENTLY. A cheap head on a dirty grid
+        can be 3% of the bill and 80% of the emissions, and a registry-ordered
+        list hides that completely. So the two rankings lead, side by side,
+        and the per-provider detail follows for when exact numbers are wanted.
+        """
+        rows, gemini_live_storage = self._cost_rows(providers)
 
         grand_total = sum(r["cost"] for r in rows)
         storage_total = sum(r["storage"] for r in rows)
@@ -2997,12 +3029,7 @@ class ConversationManager:
                 return "${:,.2f}".format(v)
             return "<$0.01" if v > 0 else "$0.00"
 
-        def mass(g):
-            if g >= 1000:
-                return "{:,.1f} kg".format(g / 1000)
-            # "0 g" reads as "none"; "<1 g" reads as "negligible", which is
-            # what a sub-gram figure actually means.
-            return "{:,.0f} g".format(g) if g >= 0.5 else "<1 g"
+        mass = _mass_co2
 
         def share(part, whole):
             if not whole:
@@ -3028,6 +3055,25 @@ class ConversationManager:
             and the canonical name stays untouched.
             """
             return name if len(name) <= 9 else name[:8] + "\u2026"
+
+        def fit_list(prefix, items, suffix="", budget=330):
+            """Join a ranked list, keeping whole entries up to a budget.
+
+            These two lines carry EVERY provider at full name length, so they
+            are the part of the summary that grows fastest with the fleet.
+            They are ordered by the metric, so the entries worth reading are
+            at the front and the rest become a count -- never a mid-word cut.
+            """
+            kept = []
+            used = len(prefix) + len(suffix)
+            for n, item in enumerate(items):
+                extra = len(item) + (3 if kept else 0)
+                if kept and used + extra > budget:
+                    return (prefix + " \u00b7 ".join(kept) + suffix
+                            + " \u00b7 +{} more".format(len(items) - n))
+                kept.append(item)
+                used += extra
+            return prefix + " \u00b7 ".join(kept) + suffix
 
         lines.append("{:<26}{}".format("by cost", "by CO2e"))
         for i in range(len(rows)):
@@ -3076,10 +3122,10 @@ class ConversationManager:
             # emit?" vs "what should we route to?"), so the volume-free one
             # gets its own line rather than being inferred from the table.
             intensity_rank = sorted(rows, key=lambda r: r["intensity"])
-            lines.append(
-                "\u2696\uFE0F **Per Mtok** (volume-free): " + " \u00b7 ".join(
-                    "{} {:,.0f} g".format(r["p"].name, r["intensity"])
-                    for r in intensity_rank))
+            lines.append(fit_list(
+                "\u2696\uFE0F **Per Mtok** (volume-free): ",
+                ["{} {:,.0f} g".format(r["p"].name, r["intensity"])
+                 for r in intensity_rank]))
             # Lowest first, because the question is "what is the least
             # waste a dollar can make", and omitting the undefined rows beats
             # printing a 0 that reads as "perfectly clean".
@@ -3089,11 +3135,11 @@ class ConversationManager:
                     if v >= 1000:
                         return "{:,.1f}k".format(v / 1000)
                     return "{:,.0f}".format(v) if v >= 1 else "<1"
-                lines.append(
-                    "\U0001F4B5 **Per $** (lower better): " + " \u00b7 ".join(
-                        "{} {}".format(r["p"].name, gpd(r["per_dollar"]))
-                        for r in sorted(priced, key=lambda r: r["per_dollar"]))
-                    + " g")
+                lines.append(fit_list(
+                    "\U0001F4B5 **Per $** (lower better): ",
+                    ["{} {}".format(r["p"].name, gpd(r["per_dollar"]))
+                     for r in sorted(priced, key=lambda r: r["per_dollar"])],
+                    suffix=" g"))
             lines.append(
                 "   _Order-of-magnitude: grid per provider, non-reasoning "
                 "baseline, location-based (not REC-adjusted). Tune in .env._")
@@ -3134,26 +3180,75 @@ class ConversationManager:
                     if unattributed else "")
             lines.append("\U0001F3B2 **Chosen by**: " + parts + tail)
 
-        # Discord REJECTS a message over 2,000 chars outright, and the
-        # 7-head case with peak surcharges, tool-call clauses and plan
-        # footers gets close. The rankings and totals ARE the answer, so
-        # Detail is what gives way: a trimmed summary beats no summary.
-        head = list(lines)
-        lines.append("**Detail**")
-        for r in by_cost:
+        # Per-provider detail used to live here and no longer does. It
+        # costs ~115 characters a provider, so the eight-head fleet could not
+        # fit it beside the rankings and it was being trimmed away -- and a
+        # section that silently shrinks is worse than one you ask for.
+        # !costdetail gets a message of its own (sent through the chunking
+        # path, so nothing is dropped however many heads are configured) and
+        # can answer about a single head.
+        lines.append("\U0001F4CB **Breakdown**: `!costdetail` "
+                     "(or `!costdetail claude` for one head)")
+        out = "\n".join(lines)
+        # Discord REJECTS an over-length message outright rather than
+        # truncating it, so this is a backstop, not a formatter: with Detail
+        # moved out and both ranked lists budgeted above, a realistic fleet
+        # lands near 1,200 characters and this never fires.
+        if len(out) > 1990:
+            # Drop whole LINES, never a character position: a positional cut
+            # can land between a "**" pair and orphan the delimiter, bolding
+            # everything after it (the same class of bug as the underscore
+            # that ate AMORTIZE_TRAINING). Every line here is internally
+            # balanced, so line-wise trimming keeps the markdown valid.
+            note = "   _(trimmed: {} line(s) over Discord's 2,000-char cap)_"
+            for keep in range(len(lines) - 1, 0, -1):
+                body = lines[:keep] + [note.format(len(lines) - keep)]
+                # A trim inside the ranking table leaves the fence open and
+                # renders everything after it as code.
+                if "\n".join(body).count("```") % 2:
+                    body.insert(keep, "```")
+                out = "\n".join(body)
+                if len(out) <= 1990:
+                    break
+        return out
+
+    def get_cost_detail(self, providers: list[ModelProvider],
+                        only: ModelProvider = None) -> str:
+        """Exact per-provider numbers behind !cost: tokens, hits, Wh, grid, $.
+
+        Its own command rather than a section of !cost. !cost is the SHAPE of
+        the answer -- two rankings, the totals, the intensities -- and has to
+        stay one scannable message; this is the precision half, and it grows
+        linearly with the fleet. Sent chunked, so it is never trimmed.
+        """
+        rows, gemini_live_storage = self._cost_rows(providers)
+        if only is not None:
+            rows = [r for r in rows if r["p"] is only]
+            if not rows:
+                return ("\U0001F4CB **{}**: nothing billed yet (no requests, "
+                        "no cache storage).".format(only.name))
+        if not rows:
+            return "\U0001F4B0 No API calls made yet."
+
+        # No name in the single-head header: the row below already names it,
+        # and saying it twice reads like two different figures.
+        lines = ["\U0001F4CB **Cost detail**" if only is not None
+                 else "\U0001F4CB **Per-provider cost detail**"]
+        for r in sorted(rows, key=lambda r: r["cost"] + r["storage"],
+                        reverse=True):
             p = r["p"]
             total_in = r["in"] + r["cached"]
             hit = (r["cached"] / total_in * 100) if total_in else 0.0
             cache_note = (", \U0001F7E2 {:,} cached ({:.0f}% hit)".format(
                 r["cached"], hit) if r["cached"] else "")
-            # Self-hosted / local backends bill electricity, not per token —
+            # Self-hosted / local backends bill electricity, not per token --
             # show that instead of a $0.0000 that reads like "free". The
             # energy figures still report (tokens are counted) on the
             # self-host grid.
             if p.cost_mode == "local":
-                cost_str = "local (no per-token $ — electricity only)"
+                cost_str = "local (no per-token $ \u2014 electricity only)"
             elif p.cost_mode == "plan":
-                fee = (" — ${:.2f}/mo flat".format(p.plan_monthly_usd)
+                fee = (" \u2014 ${:.2f}/mo flat".format(p.plan_monthly_usd)
                        if p.plan_monthly_usd else "")
                 cost_str = "prepaid plan (no per-token ${})".format(fee)
             else:
@@ -3176,10 +3271,10 @@ class ConversationManager:
             grid = (p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None
                     else GRID_GCO2_PER_KWH)
             lines.append(
-                "  **{}**: {} req, {:,} in + {:,} out{} = {} "
+                "  **{}**: {} requests, {:,} in + {:,} out{} = {} "
                 "\u00b7 {:.1f} Wh, {} CO2e (grid ~ {:.0f})".format(
                     p.name, p.total_requests, r["in"], r["out"], cache_note,
-                    cost_str, r["energy"], mass(r["co2"]), grid))
+                    cost_str, r["energy"], _mass_co2(r["co2"]), grid))
             if r["storage"] > 0:
                 live = (", ${:.4f} still accruing on a live cache".format(
                     gemini_live_storage)
@@ -3187,33 +3282,9 @@ class ConversationManager:
                 lines.append(
                     "      \u23F3 + ~${:.4f} Gemini cache storage "
                     "(time-based, per token-hour{})".format(r["storage"], live))
-        out = "\n".join(lines)
-        if len(out) > 1990:
-            # Fill Detail up to the budget rather than dropping all of it: it
-            # is ordered by spend, so the rows that survive are the ones worth
-            # reading. Dropping the section wholesale is what the 8-provider
-            # fleet triggered on its first live run.
-            #
-            # Shrink until it FITS rather than reserving a guessed number of
-            # characters for the closing note: a first attempt reserved 60 and
-            # the note was 78, which put the message at 2,002 -- i.e. still
-            # rejected, by a feature meant to prevent exactly that.
-            detail = lines[len(head):]
-            note = ("  _({} more provider line(s) omitted \u2014 Discord caps "
-                    "a message at 2,000 chars)_")
-            for keep in range(len(detail), -1, -1):
-                omitted = len(detail) - keep
-                body = head + detail[:keep]
-                if omitted:
-                    body = body + [note.format(omitted)]
-                out = "\n".join(body)
-                if len(out) <= 1990:
-                    break
-            # Last resort, so an over-length message is impossible no matter
-            # how the head grows: a hard cut Discord will still accept.
-            if len(out) > 1990:
-                out = out[:1987] + "\u2026"
-        return out
+        if only is None:
+            lines.append("\U0001F4B0 **Rankings, totals and carbon**: `!cost`")
+        return "\n".join(lines)
 
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
         """Save all memories to disk (synchronous - use save_memories_async in async contexts)."""
@@ -8577,6 +8648,33 @@ Return one JSON object only:
         cleaned = self.FRENCH_MARKER_RE.sub(lambda m: m.group(1).strip(), ''.join(out))
         return cleaned, files
 
+    def _resolve_usage_provider(self, token: str):
+        """Find a billable provider from a word the user typed.
+
+        Accepts anything the router already accepts -- a canonical bare prefix
+        or the active theme's flavor alias (rei -> Qwen) -- plus the canonical
+        id/name/display name and an unambiguous prefix of it. The prefix match
+        is what makes non-routing pseudo-providers reachable: the Haiku
+        participation gate bills real money but has no alias, so "haiku" is
+        the only handle it has.
+        """
+        t = token.strip().lower().lstrip("!")
+        if not t:
+            return None
+        flag = self.alias_to_flag.get("!" + t)
+        if flag and flag != "think":
+            for p in self.usage_providers:
+                if p.id == flag:
+                    return p
+        for p in self.usage_providers:
+            if t in (p.id.lower(), p.name.lower(),
+                     (p.display_name or "").lower()):
+                return p
+        hits = [p for p in self.usage_providers
+                if p.name.lower().startswith(t)
+                or (p.display_name or "").lower().startswith(t)]
+        return hits[0] if len(hits) == 1 else None
+
     async def _handle_command(self, message: discord.Message) -> None:
         """Handle bot commands."""
         content = message.content.strip()
@@ -8599,6 +8697,27 @@ Return one JSON object only:
         elif cmd == "!cost":
             summary = self.manager.get_cost_summary(self.usage_providers)
             await self._send_response(message.channel, summary)
+
+        elif cmd in ("!costdetail", "!breakdown", "!detail"):
+            # Split out of !cost 2026-11-08: the per-provider rows are the
+            # precision half of the answer and grew past what one Discord
+            # message can hold beside the rankings. Re-split on maxsplit=1 so
+            # a multi-word name ("haiku participation gate") survives.
+            bits = message.content.strip().split(maxsplit=1)
+            arg = bits[1].strip() if len(bits) > 1 else ""
+            only = None
+            if arg:
+                only = self._resolve_usage_provider(arg)
+                if only is None:
+                    await message.channel.send(
+                        "\u2753 No provider matches `{}`. Try: {}".format(
+                            arg[:40].replace("`", ""),
+                            " \u00b7 ".join(p.name
+                                            for p in self.usage_providers)))
+                    return
+            detail = self.manager.get_cost_detail(
+                self.usage_providers, only=only)
+            await self._send_response(message.channel, detail)
 
         elif cmd == "!presence":
             scope = self._participation_scope(message)
@@ -10048,6 +10167,7 @@ Return one JSON object only:
 **Commands:**
 `!context` - Show current context size and cost estimate
 `!cost` - Show total API usage and cost per model
+`!costdetail [provider]` - Exact per-provider numbers behind `!cost` (tokens, cache hits, Wh, grid)
 `!memories` - List all memories (both types)
 `!threads` - Show other recent threads in this channel
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)

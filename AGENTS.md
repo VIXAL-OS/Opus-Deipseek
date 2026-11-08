@@ -139,6 +139,28 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-11-08
 
+### ✅ `!cost` split: per-provider detail is now `!costdetail` (2026-11-08)
+Full detail in CLAUDE.md.
+- **The italics in the pasted summary were wrong, and the running bot was already fixed** (paste
+  9:44, restart 9:51:09 onto the 09:50:45 fix). `AMORTIZE_TRAINING`'s bare `_` opened an italic run
+  that closed on the omission note's opening `_` two lines later, eating the underscore and
+  orphaning the note's closing one.
+- **The guard is now generic:** strip code spans and fences, assert `**` and `_` counts are both
+  even, over every shape these commands emit. It immediately caught the same class of bug in the
+  2,000-char backstop, which cut at a character position; it now drops whole **lines** and
+  re-closes the fence.
+- **`!costdetail`** (aliases `!breakdown` / `!detail`, optional single head) takes the per-provider
+  rows out of `!cost`. `!cost` is the shape of the answer and must fit one message; detail is the
+  precision half and grows with the fleet. `!cost` is now 1,283 chars at 8 heads and points at the
+  new command, which is chunked — so all 8 rows render in full and nothing is omitted.
+  `!costdetail rei` works via the router's alias map; a name prefix is the gate's only handle.
+- `_cost_rows()` is shared by both commands so they cannot disagree; the two ranked lists are
+  budgeted to 330 chars with a `+N more` tail.
+- **US units for the car:** `CO2_G_PER_MILE_GAS_CAR` (400, the EPA's own per-mile figure) replaces
+  the g/km conversion; feet below a mile; "gasoline". Energy and mass stay metric.
+- `test_cost_summary_format.py` 65 → 85/85, `test_selection_attribution.py` → 35. Nothing
+  to mirror to ISAIC (no ranked `!cost` there).
+
 ### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
 Full detail in CLAUDE.md. The channel recovered and `!cost` live-confirmed both new features
 (`Chosen by: auto 35% · yours 65%`, `Per $ ... Deepseek 5.3k g`). It also exposed three things no
@@ -247,7 +269,7 @@ emissions** — cheap head, dirty grid, far more tokens.
   Nothing from the old format was dropped — tokens, cache hit rates, Gemini cache storage, the
   `local` label, the prepaid-plan footer, peak surcharge and per-request tool spend all live in
   Detail, each pinned by the harness.
-- **`_co2_equivalents()`** renders km in an average petrol car (`CO2_G_PER_KM_PETROL_CAR` 250 g/km,
+- **`_co2_equivalents()`** renders km in an average petrol car (renamed to miles/gasoline 2026-11-08, see above; then `CO2_G_PER_KM_PETROL_CAR` 250 g/km,
   from the EPA's ~400 g/mile — **tailpipe only**, so it understates driving, the conservative
   direction here) and hours of PC gaming on a coal grid (`GAMING_PC_WATTS` 400 W ×
   `COAL_GRID_GCO2_PER_KWH` 820, IPCC AR5 coal median). Two anchors deliberately — a longer list
