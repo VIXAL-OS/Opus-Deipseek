@@ -158,8 +158,16 @@ Full detail in CLAUDE.md.
   budgeted to 330 chars with a `+N more` tail.
 - **US units for the car:** `CO2_G_PER_MILE_GAS_CAR` (400, the EPA's own per-mile figure) replaces
   the g/km conversion; feet below a mile; "gasoline". Energy and mass stay metric.
-- `test_cost_summary_format.py` 65 → 85/85, `test_selection_attribution.py` → 35. Nothing
-  to mirror to ISAIC (no ranked `!cost` there).
+- `test_cost_summary_format.py` 65 → 85/85, `test_selection_attribution.py` → 35.
+- **Ported to ISAIC in full** (Sarah's call): it had none of the stack. Extracted verbatim from
+  `bot.py` so the copies cannot drift. Three adaptations — a lone `~` is Slack
+  **strikethrough** so every tilde became `≈` (the underscore bug, different character);
+  the 1,990 budget stays, to keep the fenced table in one chunk and one harness for both repos;
+  and `cost_mode="plan"` had to come along because the summary references it. `**bold**` needs
+  nothing — `md_to_mrkdwn` converts on send. Verified through the real converter: one chunk,
+  fence intact, no leftover `**`. Three harnesses now shared via `BOT_MODULE=isaic.core`
+  (cost format 90/90 there, attribution 35/35, prompt cache 32/32); ISAIC's 13 harnesses green.
+  ⚠️ Offline-only — that checkout has no live `config.json`.
 
 ### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
 Full detail in CLAUDE.md. The channel recovered and `!cost` live-confirmed both new features

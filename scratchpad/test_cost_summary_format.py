@@ -19,6 +19,10 @@ import sys
 
 sys.path.insert(0, os.getcwd())
 bot = importlib.import_module(os.getenv("BOT_MODULE", "bot"))
+# Which platform's markdown rules apply. The Slack bot converts **bold** on
+# send, so the summary is written in the same Markdown either way -- but its
+# delimiter set is larger (see the tilde section at the bottom).
+SLACK = os.getenv("BOT_MODULE", "bot") != "bot"
 
 ok = fail = 0
 
@@ -374,9 +378,13 @@ print("\nno emphasis marker can run past its own line")
 # So the invariant worth pinning is not "backtick that one identifier" but
 # "every emphasis marker outside a code span is balanced", over everything
 # these two commands emit.
-def emphasis_balanced(text):
+def outside_code(text):
     t = re.sub(r"```.*?```", "", text, flags=re.S)   # fenced blocks
-    t = re.sub(r"`[^`]*`", "", t)                    # inline code spans
+    return re.sub(r"`[^`]*`", "", t)                 # inline code spans
+
+
+def emphasis_balanced(text):
+    t = outside_code(text)
     return (t.count("**") % 2 == 0
             and t.replace("**", "").count("_") % 2 == 0)
 
@@ -386,6 +394,20 @@ for label, txt in (("!cost", out), ("!cost with 8 heads", eight),
     check("emphasis is balanced in " + label, emphasis_balanced(txt))
 check("and the check is not a tautology - it catches the real bug",
       not emphasis_balanced("AMORTIZE_TRAINING=0\n  _(a note)_"))
+
+# Slack has a delimiter Discord does not: a LONE "~" is strikethrough in
+# mrkdwn (Discord needs "~~"), so an odd number of them silently strikes out
+# everything in between -- the underscore bug with a different character.
+# ISAIC therefore renders every "approximately" as U+2248; Hydra's tildes are
+# safe on Discord and stay as they are. This is why the summary cannot simply
+# be shared verbatim between the two repos.
+if SLACK:
+    print("\nand Slack's own delimiter: no lone tilde may reach mrkdwn")
+    for label, txt in (("!cost", out), ("!cost with 8 heads", eight),
+                       ("!cost worst case", hout), ("!costdetail", eight_dt)):
+        check("no lone tilde in " + label, "~" not in outside_code(txt))
+    check("the approximation sign is used instead",
+          "\u2248" in out)
 
 print("\nit still fits a Discord message")
 every = [provider(c, 50, 500_000, 20_000, 100_000) for c in (

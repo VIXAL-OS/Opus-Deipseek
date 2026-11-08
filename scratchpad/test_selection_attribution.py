@@ -22,6 +22,7 @@ import sys
 
 sys.path.insert(0, os.getcwd())
 bot = importlib.import_module(os.getenv("BOT_MODULE", "bot"))
+BotClass = getattr(bot, "ClaudeBot", None) or getattr(bot, "IsaicBot")
 
 ok = fail = 0
 
@@ -156,7 +157,7 @@ print("\n_panel_complete bills machinery, then restores the turn's own mode")
 
 
 async def _panel():
-    b = bot.ClaudeBot.__new__(bot.ClaudeBot)
+    b = BotClass.__new__(BotClass)
     seen = []
 
     async def spy(*a, **k):
@@ -166,7 +167,7 @@ async def _panel():
     b._panel_complete_dispatch = spy
     # A !research inside a chat turn: the turn already set its own mode.
     bot._SELECTION_MODE.set("override")
-    out = await bot.ClaudeBot._panel_complete(b, None, 1, [], "sys")
+    out = await BotClass._panel_complete(b, None, 1, [], "sys")
     return seen, out, bot._SELECTION_MODE.get()
 
 
@@ -210,7 +211,7 @@ class _Msg:
 
 
 def _bot_for_selection(pref=None, default_model="claude"):
-    b = bot.ClaudeBot.__new__(bot.ClaudeBot)
+    b = BotClass.__new__(BotClass)
     b.providers = [copy.deepcopy(c) for c in
                    (bot.CLAUDE_PROVIDER, bot.DEEPSEEK_PROVIDER,
                     bot.QWEN_PROVIDER)]

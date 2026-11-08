@@ -218,8 +218,35 @@ americans. the other measurements can stay metric."*
   command's full 8-row output; single-head and never-billed branches; the budgeted lists; and every
   unit change) and `test_selection_attribution.py` 34 → **35**. Moved checks now read
   `get_cost_detail` rather than searching `!cost` for strings that left it.
-- **Nothing to mirror to ISAIC:** it never received the ranked `!cost`, so it has no Detail
-  section, no `_co2_equivalents` and no petrol reference to correct.
+- **PORTED TO ISAIC IN FULL** (same day, Sarah: *"we should probably honestly mirror the cost
+  stuff to ISAIC as well"*). ISAIC had **none** of the stack — no ranked columns, no everyday
+  equivalents, no per-Mtok or per-$, no attribution, no `cost_mode="plan"`; just the old
+  registry-ordered list. All of it is there now, **extracted verbatim from `bot.py` by the port
+  script rather than retyped**, so the two copies cannot drift in wording. Three adaptations were
+  needed, and only three:
+  - **A lone `~` is STRIKETHROUGH in Slack mrkdwn** (Discord needs `~~`), so every tilde in the
+    rendered output becomes `≈` — which is why ISAIC already used `≈` everywhere.
+    It is the AMORTIZE_TRAINING underscore bug with a different character: an odd count silently
+    strikes out everything in between. The shared harness now checks it under
+    `BOT_MODULE=isaic.core`. **This is the reason the summary cannot be shared byte-for-byte.**
+  - **The char budget stays Discord's 1,990** even though Slack chunks rather than rejecting,
+    because a chunk boundary inside the fenced ranking table would render the remainder as code
+    — and one budget lets both repos run one harness. Verified end-to-end through the real
+    `md_to_mrkdwn`: 1,282 chars → 1,266, **one** chunk, fence markers 2, zero `**` left over.
+  - **`cost_mode="plan"` had to come too**, since the ported summary references it: the field,
+    BOTH dollar gates, `_BACKEND_FIELD_MAP`, the config validation and the startup line. ISAIC
+    had only `metered`/`local`.
+  `**bold**` needed no adaptation — `md_to_mrkdwn` converts it on send, so both repos write
+  the same Markdown. `!costdetail` uses `channel.send` (which converts AND chunks) instead of
+  Discord's `_send_response`.
+- **Three harnesses are now shared** (copied into `isaic-slack-bot/scratchpad/`, run with
+  `BOT_MODULE=isaic.core`): `test_cost_summary_format.py` (**90/90** there — the five extra
+  checks are the Slack tilde rule), `test_selection_attribution.py` (**35/35**, made bot-agnostic
+  the same way `test_assistant_images.py` was) and the updated `test_prompt_cache_order.py`
+  (**32/32** — the `_panel_complete` wrapper landed in ISAIC too, so its copy needed Hydra's
+  two-function check). ISAIC's full suite: **13 harnesses green**.
+- ⚠️ ISAIC's port is **offline-validated only** — that checkout has no live
+  `config.json`, so the mrkdwn was verified by running the real converter, not by posting to Slack.
 - ⚠️ **Owes one live check:** `!cost` then `!costdetail` (and `!costdetail haiku`) in
   Discord after a restart.
 
@@ -375,7 +402,7 @@ line: **`🎲 Chosen by: auto 65% · yours 24% · machinery 11% · 61.5M unattri
   persistence round trip incl. a pre-2026-11-07 save and a dict-aliasing check, all four
   `_select_model` branches driven through the real method, and the display's honesty about
   unattributed history). Full suite green; syntax + import gates pass.
-- ⚠️ **Not ported to ISAIC**, which still has the registry-ordered `!cost`.
+- ✅ **Ported to ISAIC 2026-11-08** along with the rest of the cost stack (see above).
 - ⚠️ **Owes one live check**: two real Discord turns — one plain (auto) and one `!claude`
   (override) — then `!cost`, to confirm the buckets fill as expected on the live wiring.
 
