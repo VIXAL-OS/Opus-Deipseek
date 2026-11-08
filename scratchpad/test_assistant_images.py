@@ -28,6 +28,7 @@ import sys
 
 sys.path.insert(0, os.getcwd())
 bot = importlib.import_module(os.getenv("BOT_MODULE", "bot"))
+BotClass = getattr(bot, "ClaudeBot", None) or getattr(bot, "IsaicBot")
 
 ok = fail = 0
 
@@ -188,19 +189,19 @@ check("the fact that an image was posted is still recorded",
 check("and the bot's own text survives beside it", "here it is" in blob)
 
 print("\nand the shim can no longer emit an assistant image_url")
-b = bot.ClaudeBot.__new__(bot.ClaudeBot)
+b = BotClass.__new__(BotClass)
 ds = copy.deepcopy(bot.DEEPSEEK_PROVIDER)
 check("Deepseek really is vision-enabled now (the flip that exposed this)",
       ds.supports_vision is True)
 # Vision-capable providers skip _strip_images_from_messages entirely, so the
 # sanitised history is all that stands between us and the 400.
-conv = bot.ClaudeBot._convert_messages_to_openai_format(b, hist)
+conv = BotClass._convert_messages_to_openai_format(b, hist)
 bad = [c for c in conv if c.get("role") == "assistant"
        and isinstance(c.get("content"), list)
        and any(p.get("type") == "image_url" for p in c["content"])]
 check("no assistant turn carries an image_url after conversion", not bad)
 # Prove the test would catch a regression: unsanitised history still would.
-poisoned = bot.ClaudeBot._convert_messages_to_openai_format(
+poisoned = BotClass._convert_messages_to_openai_format(
     b, [{"role": "assistant", "content": [img()]}])
 check("the check is live — unsanitised input DOES produce one",
       poisoned[0]["content"][0]["type"] == "image_url")
