@@ -102,6 +102,14 @@ self-contained — you don't need it to pick up the remaining work below.
   inside a chat turn that is not itself a model choice must `set` **and `reset`** (see
   `_panel_complete`), because a bare `set` leaks for the remainder of that Task. Guarded by
   `scratchpad/test_selection_attribution.py`.
+- **Images are legal ONLY in user turns.** Anthropic, DeepSeek and the OpenAI content-part schema
+  all reject an image outside a user message, and ONE such block 400s every subsequent turn in that
+  channel until it scrolls out of history. `fetch_thread_history` roles by author and includes our
+  own messages, so any image the BOT posts is a candidate — `_strip_assistant_images` (just before
+  `_is_real_bot`) is the guard, and it must keep running at the end of history assembly. Do NOT
+  rely on `_strip_images_from_messages`: that one only fires for `supports_vision=False` providers,
+  which is exactly why enabling Deepseek vision exposed this. Guarded by
+  `scratchpad/test_assistant_images.py`.
 - **Model slugs drift** — verify in the live libraries (Fireworks retires serverless models on
   ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
   Alibaba `qwen3.8-flash` (live on `dashscope-us` 2026-09-21), Fireworks `glm-5p3` + the `qwen3p8-max` /
@@ -152,7 +160,52 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-11-07
+## Status — 2026-11-08
+
+### 🔴→✅ LIVE OUTAGE: an image in an assistant turn 400'd every turn (2026-11-08)
+At 08:26 both heads started failing on *every* message in a channel — on a plain "salam aleykum"
+that contained no image at all:
+```
+[Deepseek] 400 — Image in assistant message is not supported
+[Claude]   400 — messages.9.content: 'image' blocks are not permitted within assistant turns
+```
+**Root cause.** `fetch_thread_history` appends an image block for *any* image attachment it finds,
+and roles each message by AUTHOR (`role = "assistant" if _is_real_bot(msg) else "user"`). Our own
+messages are deliberately included in history (that is how the bot sees what it said), so **a bot
+message carrying an image — one of our own LaTeX renders, a chart — becomes an illegal assistant
+image block, and from then on EVERY turn in that channel 400s until it scrolls out of the window.**
+`messages.9` was ours, not the user's.
+- **Why it surfaced the morning after the vision flip.** `_strip_images_from_messages` drops image
+  content wholesale for `supports_vision=False` providers — an **accidental** shield that happened
+  to cover Deepseek. Enabling Deepseek vision (2026-11-07) removed it. **Claude never had that
+  shield at all**, so this has been live for Claude for as long as the bot has posted images into a
+  channel; it just needed an image followed by any message. Both heads failing at once is the tell
+  that the poison was in shared history, not in one provider's dispatch.
+- **Fix: one provider-agnostic invariant.** New module-level `_strip_assistant_images(messages)`
+  rewrites any image block in a non-user turn to `[Image omitted: images are only valid in user
+  turns]`, called at the END of `fetch_thread_history` — so whatever route an image takes in, it
+  cannot leave. The attachment loop additionally skips the download for bot messages and appends
+  `[Image posted: <filename>]`, which also saves a pointless base64 fetch and the tokens the block
+  would have cost. The placeholder keeps the only part a model can use in an assistant turn: that
+  an image was posted, and which file.
+- **The constraint is universal, not Anthropic-specific.** Anthropic rejects it outright; DeepSeek
+  400s (its own docs say images are valid in user messages only — recorded here yesterday); and the
+  OpenAI content-part schema the shim targets carries `image_url` inside **user** content only. So
+  the guard belongs in history assembly, not in any one dispatch path.
+- `_strip_images_from_messages`' docstring was stale too ("Deepseek is currently the only text-only
+  provider") — it now names the real text-only set (Mistral, Qwen, GLM, Kimi, sim) and carries a
+  ⚠️ that it is **not** the assistant-turn guard.
+- **Mirrored to ISAIC**, which had the identical latent bug: same builder, same role line, same
+  vision flip.
+- Offline-validated: new `scratchpad/test_assistant_images.py` (**21/21** in both repos) — the
+  invariant, user turns left untouched, every content shape (string / text-only list / empty /
+  None), `_msg_id` survival, no mutation of the caller's dicts, and an **end-to-end run of the real
+  `fetch_thread_history`** over a fake channel reproducing the outage's exact shape: our bot posting
+  `latex_render.png`, then a human saying hello. It also asserts the shim **would** still emit
+  `image_url` on unsanitised input, so the check cannot rot into a tautology.
+- ⚠️ **Owed:** the channel recovers as soon as the restarted bot rebuilds history, since history
+  is re-fetched from Discord every turn and nothing poisoned is persisted — no state to clear.
+
 
 ### ✅ `!cost` gained a per-dollar ranking — the third ordering (2026-11-07)
 Sarah: *"some kind of co2e/$ metric, where lower is better — if i'm going to spend a dollar on

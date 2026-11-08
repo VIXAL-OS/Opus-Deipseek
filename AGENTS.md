@@ -98,6 +98,14 @@ self-contained — you don't need it to pick up the remaining work below.
   inside a chat turn that is not itself a model choice must `set` **and `reset`** (see
   `_panel_complete`), because a bare `set` leaks for the remainder of that Task. Guarded by
   `scratchpad/test_selection_attribution.py`.
+- **Images are legal ONLY in user turns.** Anthropic, DeepSeek and the OpenAI content-part schema
+  all reject an image outside a user message, and ONE such block 400s every subsequent turn in that
+  channel until it scrolls out of history. `fetch_thread_history` roles by author and includes our
+  own messages, so any image the BOT posts is a candidate — `_strip_assistant_images` (just before
+  `_is_real_bot`) is the guard, and it must keep running at the end of history assembly. Do NOT
+  rely on `_strip_images_from_messages`: that one only fires for `supports_vision=False` providers,
+  which is exactly why enabling Deepseek vision exposed this. Guarded by
+  `scratchpad/test_assistant_images.py`.
 - **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-09-21):
   `glm-5p3`, `qwen3p8-max`, `deepseek-v4p1-flash` (under `accounts/fireworks/models/`); Qwen's
   default is now `qwen3.8-flash` on Alibaba US and DeepSeek's is `deepseek-flash` (see CLAUDE.md). Mistral on
@@ -129,7 +137,28 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-11-07
+## Status — 2026-11-08
+
+### 🔴→✅ LIVE OUTAGE: an image in an assistant turn 400'd every turn (2026-11-08)
+Full detail in CLAUDE.md. Both heads began failing on every message in a channel, including a plain
+greeting with no image: Deepseek *"Image in assistant message is not supported"*, Claude
+*"messages.9.content: 'image' blocks are not permitted within assistant turns"*.
+- **Cause:** `fetch_thread_history` attaches an image block for any image attachment and roles by
+  AUTHOR, and our own messages are in history — so a bot message carrying an image (a LaTeX render)
+  becomes an illegal assistant image and every later turn in that channel 400s until it scrolls
+  out. `messages.9` was ours.
+- **Why now:** `_strip_images_from_messages` was an *accidental* shield covering Deepseek while it
+  was `supports_vision=False`; the 2026-11-07 vision flip removed it. Claude never had it, so this
+  was live for Claude all along. Both heads failing at once = the poison is in shared history.
+- **Fix:** new `_strip_assistant_images(messages)` rewrites image blocks in non-user turns to a
+  placeholder, called at the end of history assembly, so no route in survives. The loop also skips
+  the fetch for bot messages (`[Image posted: <file>]`), saving a download and tokens. The
+  constraint is universal — Anthropic, DeepSeek and the OpenAI schema all allow images in user
+  turns only — so the guard belongs in assembly, not in a dispatch path.
+- `scratchpad/test_assistant_images.py` 21/21 in both repos, including an end-to-end run of the
+  real `fetch_thread_history` reproducing the outage's shape. Nothing poisoned is persisted, so the
+  channel recovers as soon as history is re-fetched.
+
 
 ### ✅ `!cost` gained a per-dollar ranking — the third ordering (2026-11-07)
 Full detail in CLAUDE.md. **`💵 Per $ (lower better): Mistral 12 · Gemini 64 · Claude 77 ·

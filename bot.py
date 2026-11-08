@@ -292,6 +292,57 @@ Don't be shy about noting things! The decay system handles cleanup automatically
 CONFIG = BotConfig()
 
 
+def _strip_assistant_images(messages: list[dict]) -> list[dict]:
+    """Replace image blocks in NON-USER turns with a text placeholder.
+
+    LOAD-BEARING INVARIANT: every provider we talk to forbids images outside
+    user turns, and one poisoned assistant turn breaks EVERY turn in that
+    channel until it scrolls out of the history window.
+      • Anthropic: 400, "'image' blocks are not permitted within assistant
+        turns".
+      • DeepSeek: 400, "Image in assistant message is not supported".
+      • The OpenAI content-part schema the shim targets only carries
+        `image_url` inside user content.
+
+    How one gets there: fetch_thread_history attaches any image attachment it
+    finds and roles the message by AUTHOR, so a bot message carrying an image
+    -- one of our own LaTeX renders, a chart, another bot's upload -- becomes
+    an illegal assistant image. That was latent for the shim providers while
+    Deepseek was supports_vision=False, because _convert_messages_to_openai_
+    format dropped image content wholesale; flipping vision on (2026-11-07)
+    stopped the dropping and the latent bug surfaced live the next morning on
+    BOTH Deepseek and Claude (Claude never had the silent drop).
+
+    The placeholder preserves the fact that an image was posted, which is the
+    part the model can actually use in an assistant turn.
+    """
+    cleaned = []
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") == "user" or not isinstance(content, list):
+            cleaned.append(m)
+            continue
+        if not any(isinstance(b, dict) and b.get("type") == "image"
+                   for b in content):
+            cleaned.append(m)
+            continue
+        blocks = [
+            {"type": "text", "text": "[Image omitted: images are only valid "
+                                     "in user turns]"}
+            if isinstance(b, dict) and b.get("type") == "image" else b
+            for b in content
+        ]
+        safe = dict(m)
+        # Collapse back to a plain string when nothing but one text block is
+        # left, matching how the builder emits simple turns.
+        if len(blocks) == 1 and blocks[0].get("type") == "text":
+            safe["content"] = blocks[0]["text"]
+        else:
+            safe["content"] = blocks
+        cleaned.append(safe)
+    return cleaned
+
+
 def _is_real_bot(msg: discord.Message) -> bool:
     """True if msg is from an actual Discord bot account, not a webhook proxy.
 
@@ -2696,7 +2747,19 @@ class ConversationManager:
             # Add images if present
             for attachment in msg.attachments:
                 if any(attachment.filename.lower().endswith(ext) for ext in CONFIG.image_types):
-                    if attachment.size <= CONFIG.max_image_size_mb * 1024 * 1024:
+                    if _is_real_bot(msg):
+                        # This message will be roled "assistant", where an
+                        # image block is ILLEGAL on every provider (see
+                        # _strip_assistant_images). Skipping the fetch also
+                        # saves a pointless download and the tokens the block
+                        # would have cost. The sanitiser at the end of this
+                        # method is the actual guarantee; this is the cheap
+                        # path.
+                        content.append({
+                            "type": "text",
+                            "text": f"[Image posted: {attachment.filename}]",
+                        })
+                    elif attachment.size <= CONFIG.max_image_size_mb * 1024 * 1024:
                         try:
                             image_data = await self._fetch_image_base64(attachment.url)
                             if image_data:
@@ -2754,6 +2817,11 @@ class ConversationManager:
         # Reverse so oldest first (Discord returns newest first)
         messages.reverse()
         
+        # Belt and braces: whatever route an image took into a non-user
+        # turn, it must not leave this method. See _strip_assistant_images --
+        # a single one 400s every subsequent turn in the channel.
+        messages = _strip_assistant_images(messages)
+
         # Ensure conversation starts with user message (API requirement)
         while messages and messages[0]["role"] == "assistant":
             messages.pop(0)
@@ -4504,9 +4572,16 @@ Return one JSON object only:
     def _strip_images_from_messages(self, messages: list[dict]) -> list[dict]:
         """Remove image content from messages for text-only models.
 
-        Only call this when provider.supports_vision is False — Gemini and Claude
-        both handle images natively and shouldn't go through this stripping.
-        Deepseek is currently the only text-only provider in the system.
+        Only call this when provider.supports_vision is False — Claude, Gemini
+        and (since 2026-11-07) Deepseek all handle images natively and
+        shouldn't go through this stripping. The text-only heads are now
+        Mistral, Qwen, GLM, Kimi and the simulator.
+
+        ⚠️ This is NOT the guard that keeps images out of assistant turns —
+        it only ran for text-only providers, so it was an accidental shield
+        that vanished for Deepseek the moment vision was enabled, and Claude
+        never had it at all. That invariant belongs to
+        _strip_assistant_images, which runs for every provider.
         """
         stripped = []
         for msg in messages:
