@@ -247,8 +247,44 @@ americans. the other measurements can stay metric."*
   two-function check). ISAIC's full suite: **13 harnesses green**.
 - ⚠️ ISAIC's port is **offline-validated only** — that checkout has no live
   `config.json`, so the mrkdwn was verified by running the real converter, not by posting to Slack.
-- ⚠️ **Owes one live check:** `!cost` then `!costdetail` (and `!costdetail haiku`) in
-  Discord after a restart.
+- ✅ **LIVE-CONFIRMED 2026-11-08 18:31** on the real 8-provider fleet: `!cost`,
+  `!costdetail` and `!costdetail haiku` all correct. Every ranking row the same width, `<$0.01`
+  and `<1 g` where they belong, `AMORTIZE_TRAINING=0` intact with **no orphaned `_` anywhere**,
+  "driving 20 miles in an average gasoline car", and all eight Detail rows in full — the gate
+  reached by name prefix alone, since it has no alias. The two commands agree: Gemini reads
+  `$15.59` in the ranking and `$3.8091` + `≈$11.7824` storage in Detail, the same money shown
+  two ways (the rankings sort on tokens+storage; Detail splits them).
+- **The live figures make the case for the inline bookclub default better than the estimate did:**
+  **$11.78 of settled Gemini cache storage against $3.81 of Gemini tokens** — 3.1× its own
+  token spend, and **26% of the entire lifetime bill**. Settled, not accruing: Detail prints no
+  "still accruing on a live cache" note, so `gemini_live_storage` is 0 and this is history from
+  before inline became the default (2026-07-08). Nothing to clean up; it is the receipt for that
+  decision.
+- ✅ **ATTRIBUTION LIVE-CONFIRMED 2026-11-08 20:12** — the check the 2026-11-07 entry
+  owed. Between two `!cost` runs the channel took **three plain messages** (auto-routed to
+  Deepseek) and **two `!claude` overrides**, and the line moved
+  `auto 35% · yours 65%` → **`auto 53% · yours 47%`**, with `63.8M unattributed`
+  unchanged — which is itself a check: new tokens landed in buckets instead of leaking into
+  the unattributed gap.
+- **The swing reproduces from the turns that happened, and it vindicates TOKENS over dollars or
+  requests.** At the measured per-request sizes (Deepseek ~118k tokens/request, Claude ~58k),
+  three auto turns + two override turns against a prior attributed total of ~580k tokens predicts
+  **exactly 53% / 47%** (`scratchpad/check_attrib.py` does the arithmetic). Meanwhile the
+  **dollars barely moved**: the total went $33.6829 → $33.8642, and *all* $0.1813 of it is
+  Claude's — three Deepseek turns at an 89% hit rate cost **~$0.0075**, invisible against a
+  2dp `$1.13`, and added ~71 Wh against 16,300, so the energy line still reads `16.3 kWh`. So a
+  cheap head's auto-routed turns are **invisible in every other column and plainly visible in
+  who-decided**, which is the whole reason this line exists. Had it counted requests it would
+  have read 60/40; dollars, 1/99.
+- ⚠️ **`machinery` is still unexercised** — correctly absent, since no panel,
+  judge, recap, `!summarize` or G2P ran, and the participation classifier did not fire on turns
+  addressed to the bot directly. It needs one `!research` or one ambient-participation turn.
+- **Worth knowing: a model reading the channel will report fixed bugs as current ones.** Deepseek,
+  asked for a status check, volunteered that `!cost` showed *"31 km"* one run and *"20 miles"* the
+  next and that *"provider rows briefly collided"* — accurate about what is in its history,
+  but both of those are the **pre-fix** messages still inside the context window, not live
+  defects. It will keep saying so until they scroll out. The same property that makes
+  `fetch_thread_history` useful makes the bot an unreliable witness to its own repairs.
 
 ### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
 The fix above worked: the channel answered normally, Deepseek even explained its own outage. The

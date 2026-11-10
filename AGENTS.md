@@ -168,6 +168,20 @@ Full detail in CLAUDE.md.
   fence intact, no leftover `**`. Three harnesses now shared via `BOT_MODULE=isaic.core`
   (cost format 90/90 there, attribution 35/35, prompt cache 32/32); ISAIC's 13 harnesses green.
   ⚠️ Offline-only — that checkout has no live `config.json`.
+- ✅ **Live-confirmed 2026-11-08 18:31** on the real 8-head fleet: all three commands
+  correct, rows aligned, no orphaned `_`, 20 miles of gasoline car, all eight Detail rows, gate
+  reached by name prefix. `!cost` and `!costdetail` agree on Gemini ($15.59 = $3.81 tokens +
+  $11.78 storage). That storage is **3.1× Gemini's token spend and 26% of the lifetime bill**,
+  settled rather than accruing — the receipt for the inline default.
+- ✅ **Attribution live-confirmed 20:12**: three plain turns (auto→Deepseek) + two
+  `!claude` overrides moved the line `auto 35% · yours 65%` → `auto 53% · yours
+  47%`, `63.8M unattributed` unchanged. The swing reproduces exactly from the measured
+  per-request token sizes (`scratchpad/check_attrib.py`) — and it vindicates **tokens** as
+  the unit: all $0.1813 of the spend delta is Claude's, the three Deepseek turns cost ~$0.0075
+  and moved no other column. Requests would have read 60/40, dollars 1/99. ⚠️
+  `machinery` still unexercised (needs a `!research` or an ambient turn). Also: a model reading
+  the channel reports **fixed** bugs as current — Deepseek cited the old "31 km" and the
+  collided rows, which are pre-fix messages still in its context window.
 
 ### ✅ First live 8-provider `!cost` — confirmed working, three defects fixed (2026-11-08)
 Full detail in CLAUDE.md. The channel recovered and `!cost` live-confirmed both new features
