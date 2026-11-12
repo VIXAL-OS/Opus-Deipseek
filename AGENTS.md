@@ -137,7 +137,22 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-11-08
+## Status — 2026-11-12
+### 🔴→✅ High-effort Claude turns died before leaving the process (2026-11-12)
+Full detail in CLAUDE.md. Found in the logs during a reboot; one lost turn on 2026-11-08 19:31:41
+(the *"!claude did u die"* one).
+- The SDK refuses a non-streaming request whose budget implies a >10-minute worst case
+  (`3600 * max_tokens / 128_000 > 600`, so **above 21,333**) and raises **before sending**. The
+  xhigh/max tier asks 64,000 — 3× the ceiling. Nothing was billed, so `!cost` showed no
+  trace. Plain (8,192), `!think`/high (16,000), `!summarize` (4,096) and the gate (96) were always
+  fine, which is why it stayed latent. Fires on the **auto-effort** heuristic too, not just
+  `!think`.
+- Fix: `_claude_message()` streams above `CLAUDE_NONSTREAM_MAX_TOKENS` and creates below;
+  `get_final_message()` returns the same Message, so nothing downstream changed. Both call sites in
+  `_generate_claude_response` (first request + tool-loop continuation) go through it.
+- `scratchpad/test_claude_streaming.py` 22/22 in both repos — it pins the boundary against the
+  **installed SDK**, not arithmetic. Mirrored to ISAIC, which had the identical bug.
+
 
 ### ✅ `!cost` split: per-provider detail is now `!costdetail` (2026-11-08)
 Full detail in CLAUDE.md.

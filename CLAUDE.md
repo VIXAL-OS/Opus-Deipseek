@@ -117,6 +117,14 @@ self-contained — you don't need it to pick up the remaining work below.
   identifier in a code span, and NEVER truncate a message at a character position: drop whole
   lines, which are individually balanced, and re-close any code fence the trim landed inside.
   Guarded by the emphasis check in `scratchpad/test_cost_summary_format.py`.
+- **A Claude call whose `max_tokens` can exceed ~21K MUST stream.** The SDK refuses a
+  non-streaming request whose budget implies a >10-minute worst case
+  (`3600 * max_tokens / 128_000 > 600`) and raises **before sending anything** — so the turn
+  fails for free, bills nothing, and leaves no trace in `!cost`; it just looks like the bot going
+  quiet. Route every Claude chat call through `_claude_message`, which picks stream vs create from
+  `CLAUDE_NONSTREAM_MAX_TOKENS`; never call `self.claude_client.messages.create` directly on the
+  chat path. The xhigh/max effort tier (64,000) is over the line and the tool-loop continuation
+  shares its kwargs, so both sites need it. Guarded by `scratchpad/test_claude_streaming.py`.
 - **Model slugs drift** — verify in the live libraries (Fireworks retires serverless models on
   ~2-week notice by email). Re-verified live 2026-09-21: DeepSeek `deepseek-flash` (V4.1 Flash),
   Alibaba `qwen3.8-flash` (live on `dashscope-us` 2026-09-21), Fireworks `glm-5p3` + the `qwen3p8-max` /
@@ -167,7 +175,45 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-11-08
+## Status — 2026-11-12
+### 🔴→✅ High-effort Claude turns died before leaving the process (2026-11-12)
+Found in the logs while rebooting the bot — not reported, because it looks like the bot going
+quiet. One lost turn on **2026-11-08 at 19:31:41**, which is exactly why the channel read
+*"!claude did u die"*:
+```
+ValueError: Streaming is required for operations that may take longer than 10 minutes
+on_message → _generate_response → _generate_claude_response → messages.create
+```
+- **The SDK refused the request before sending it.** `_calculate_nonstreaming_timeout` raises when
+  `3600 * max_tokens / 128_000 > 600` — **above 21,333 tokens** — a client-side guard
+  against a non-streaming request outliving the 10-minute HTTP timeout. The xhigh/max tier asks for
+  **64,000** (1,800s), three times the ceiling. **Nothing reached Anthropic**, nothing was billed,
+  and `!cost` shows no trace — which is why it never surfaced in any of the cost work.
+- **Only the deepest tier was affected**, which is why it stayed latent since the Opus 5 tiering
+  landed: plain 8,192 → 230s ✓, `!think`/high 16,000 → 450s ✓, `!summarize` 4,096
+  ✓, participation gate 96 ✓. `claude-opus-5-5` has no entry in the SDK's
+  `MODEL_NONSTREAMING_TOKENS` override table, so only the time rule applies. The trigger is the
+  **auto-effort heuristic**, so it fires on ordinary `!claude` turns it judges hard — not only
+  on explicit `!think`.
+- **Fix: one helper, not two patched call sites.** `_claude_message(**kwargs)` streams when
+  `max_tokens > CLAUDE_NONSTREAM_MAX_TOKENS` (21,333 — the SDK's own boundary, not a guess) and
+  creates otherwise. `stream.get_final_message()` returns the same `Message` object, so usage
+  accounting, the tool loop and the content-block walk are all untouched. **Both** sites in
+  `_generate_claude_response` route through it: the first request and the tool-loop continuation,
+  which reuses the same `claude_kwargs` and so carried the identical bug.
+- Offline-validated: new `scratchpad/test_claude_streaming.py` (**22/22**, and 22/22 in ISAIC). It
+  pins the boundary **against the installed SDK** by calling `_calculate_nonstreaming_timeout`
+  itself — the private helper the traceback named — so an SDK that re-tunes or renames it
+  fails the harness rather than a Discord channel. It also pins which tiers sit either side, that
+  the helper routes on the budget and forwards every kwarg untouched, and that
+  `_generate_claude_response` contains **no** bare `messages.create` and exactly two
+  `_claude_message` calls.
+- **Mirrored to ISAIC**, which had the identical latent bug — same 64,000 tier, same two call
+  sites, byte-identical text. The helper and the constant were extracted verbatim from `bot.py`
+  rather than retyped.
+- ⚠️ **Owes one live check:** `!think !claude <something hard>` in Discord, then `!cost`
+  — the turn should answer instead of going quiet, and bill as `yours`.
+
 
 ### ✅ `!cost` split: per-provider detail is now `!costdetail` (2026-11-08)
 Sarah, on the live 8-provider summary: *"can you check whether the italics are where they're
